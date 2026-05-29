@@ -1,4 +1,4 @@
-# Breeder-AI-Tool
+# Bakery-Research
 
 This repository contains plant biology GraphRAG notebooks built with Neo4j, Google Gemini, LangChain, vector search, full-text search, graph traversal, and Bakery-Genebank accession lookup when applicable.
 
