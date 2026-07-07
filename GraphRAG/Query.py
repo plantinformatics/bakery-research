@@ -5,8 +5,7 @@ import os
 import argparse
 from typing import List, Dict, Optional, Tuple, Any
 from langchain_google_genai import ChatGoogleGenerativeAI, GoogleGenerativeAIEmbeddings
-from langchain_community.graphs import Neo4jGraph
-from langchain_community.vectorstores import Neo4jVector
+from langchain_neo4j import Neo4jGraph, Neo4jVector
 import requests
 import re
 import json
