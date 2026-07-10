@@ -105,7 +105,28 @@ class PlantBioRAG:
                               node_label="Chunk", text_node_property="text",
                               embedding_node_property="embedding", 
                               index_name="vector")
+        self._ensure_semantic_cache_vector_index()
         self._clear_expired_semantic_cache()
+    
+    
+    def _ensure_semantic_cache_vector_index(self) -> None:
+        try:
+            self.graph.query(
+                """
+                CREATE VECTOR INDEX semantic_cache_vector IF NOT EXISTS
+                FOR (c:SemanticCache)
+                ON (c.embedding)
+                OPTIONS {
+                  indexConfig: {
+                    `vector.dimensions`: 3072,
+                    `vector.similarity_function`: 'cosine'
+                  }
+                }
+                """
+            )
+            logger.info("Semantic cache vector index ensured: %s", SEMANTIC_CACHE_INDEX)
+        except Exception as e:
+            logger.warning("Failed to ensure semantic cache vector index: %s", e)
 
     def _clear_expired_semantic_cache(self) -> None:
         try:
