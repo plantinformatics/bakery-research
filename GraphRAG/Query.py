@@ -3,7 +3,9 @@
 
 import os
 import argparse
-from typing import List, Dict, Optional, Tuple, Any
+import asyncio
+from dataclasses import dataclass
+from typing import AsyncGenerator, List, Dict, Optional, Tuple, Any, Union
 from langchain_google_genai import ChatGoogleGenerativeAI, GoogleGenerativeAIEmbeddings
 from langchain_neo4j import Neo4jGraph, Neo4jVector
 import requests
@@ -12,6 +14,8 @@ import json
 import warnings
 import logging
 import time
+from enum import Enum
+from pydantic import BaseModel, Field
 from langchain_core.prompts import PromptTemplate
 from neo4j.graph import Node, Relationship, Path
 import numpy as np
@@ -20,8 +24,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 warnings.simplefilter("ignore", DeprecationWarning)
 
 logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(name)s - %(message)s"
+    level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s - %(message)s"
 )
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("google_genai").setLevel(logging.WARNING)
@@ -46,6 +49,60 @@ ACCESSION_API_TOKEN = "research_accessions"
 ACCESSION_API_TIMEOUT = 120
 
 METADATA_MAX_CHARACTERS = 300000
+
+
+class Stage(str, Enum):
+    """Ordered stages of a `PlantBioRAG.query()` run, named after the
+    existing `logger.info(...)` milestones."""
+
+    EXPANDING_QUESTION = "expanding_question"  # "Analysis of question"
+    RETRIEVING_CONTEXT = "retrieving_context"  # "Concurrent retrieval"
+    GENERATING_ANSWER = "generating_answer"  # "Call LLM to answer"
+    CHECKING_AGG_ACCESSIONS = (
+        "checking_agg_accessions"  # "Extract accessions" / "Call accession API"
+    )
+    PRESENTING_ACCESSIONS = (
+        "presenting_accessions"  # "Summarise and present accession results"
+    )
+
+
+class RunState(BaseModel):
+    """Minimal, JSON-serializable snapshot of where a `query()` run is at."""
+
+    stage: Stage
+    expanded_question: Optional[str] = None
+    species: str = ""
+    is_agg_accession_query: bool = False
+    needs_clarification: bool = False
+    accessions: List[str] = Field(default_factory=list)
+    usage_metadata: dict = Field(default_factory=dict)
+    error: Optional[str] = None
+
+
+# Internal, protocol-agnostic events yielded by `PlantBioRAG.run()`.
+# The wiring layer (main.py) maps these to `ag_ui.core` events.
+@dataclass
+class StageChangeEvent:
+    state: RunState
+
+
+@dataclass
+class TextEvent:
+    text: str
+
+
+@dataclass
+class ResultEvent:
+    state: RunState
+
+
+@dataclass
+class ErrorEvent:
+    state: RunState
+
+
+RunEvent = Union[StageChangeEvent, TextEvent, ResultEvent, ErrorEvent]
+
 
 global_instruction_and_information = """
 You are an expert of a plant biology organisation. 
@@ -88,43 +145,53 @@ A QTL dataset defines single positions or intervals within a Genome or Genetic M
 - In this way, combining all the above, genes underlying QTLs for a given trait can be found 
 """
 
+
 class PlantBioRAG:
     def __init__(self):
         self.emb = GoogleGenerativeAIEmbeddings(model=GEMINI_EMBEDDING_MODEL)
         self.llm = ChatGoogleGenerativeAI(model=GEMINI_MODEL, temperature=0)
         self.graph = Neo4jGraph()
-        self.vs = Neo4jVector(embedding=self.emb, url=os.getenv("NEO4J_URI"),
-                              username=os.getenv("NEO4J_USERNAME"),
-                              password=os.getenv("NEO4J_PASSWORD"),
-                              node_label="Chunk", text_node_property="text",
-                              embedding_node_property="embedding", 
-                              index_name="vector")
-    
-    # 1. Literature Graph RAG 
-    # 1. Vector indexing 
-    def _vector_chunks(self, q: str, k: int = QUERY_VECTOR_MAX_CHUNKS) -> Dict[str, float]:
+        self.vs = Neo4jVector(
+            embedding=self.emb,
+            url=os.getenv("NEO4J_URI"),
+            username=os.getenv("NEO4J_USERNAME"),
+            password=os.getenv("NEO4J_PASSWORD"),
+            node_label="Chunk",
+            text_node_property="text",
+            embedding_node_property="embedding",
+            index_name="vector",
+        )
+
+    # 1. Literature Graph RAG
+    # 1. Vector indexing
+    def _vector_chunks(
+        self, q: str, k: int = QUERY_VECTOR_MAX_CHUNKS
+    ) -> Dict[str, float]:
         out = {}
         # 1 means the vectors are identical (most similar). 0 means the vectors are diametrically opposite (most dissimilar).
         for doc, score in self.vs.similarity_search_with_score(q, k=k):
             # if score < 0.25:
             #     continue
             cid = doc.metadata.get("chunk_id")
-            if cid: out[cid] = max(out.get(cid, 0), score)
-        return out    
+            if cid:
+                out[cid] = max(out.get(cid, 0), score)
+        return out
 
     def escape_lucene_plain_text(self, q: str) -> str:
         _LUCENE_SPECIAL_CHARS = re.compile(r'([+\-!(){}\[\]^"~*?:\\\/&|])')
-        _LUCENE_BOOLEAN_WORDS = re.compile(r'\b(AND|OR|NOT)\b')
+        _LUCENE_BOOLEAN_WORDS = re.compile(r"\b(AND|OR|NOT)\b")
         # Treat user input as plain text for a Lucene-backed Neo4j fulltext query: Escapes Lucene query parser metacharacters; Lowercases uppercase Boolean operators so they are searched as words; Normalises whitespace.
         if not q:
             return ""
         q = re.sub(r"\s+", " ", q).strip()
         q = _LUCENE_BOOLEAN_WORDS.sub(lambda m: m.group(1).lower(), q)
         q = _LUCENE_SPECIAL_CHARS.sub(r"\\\1", q)
-        return q    
+        return q
 
     # Run vector + full-text retrieval concurrently
-    def _hybrid_scores_concurrent(self, q: str, vector_fn, fulltext_fn, k: int) -> Dict[str, float]:
+    def _hybrid_scores_concurrent(
+        self, q: str, vector_fn, fulltext_fn, k: int
+    ) -> Dict[str, float]:
         with ThreadPoolExecutor(max_workers=2) as executor:
             vector_future = executor.submit(vector_fn, q, k)
             fulltext_future = executor.submit(fulltext_fn, q, k)
@@ -133,11 +200,17 @@ class PlantBioRAG:
         return self._rrf_fusion(vector_scores, fulltext_scores)
 
     # Run expanded-query searches concurrently
-    def _multi_query_hybrid_scores_concurrent(self, expanded_queries: list[str], vector_fn, fulltext_fn, k: int) -> Dict[str, float]:
+    def _multi_query_hybrid_scores_concurrent(
+        self, expanded_queries: list[str], vector_fn, fulltext_fn, k: int
+    ) -> Dict[str, float]:
         all_fused: Dict[str, float] = {}
-        with ThreadPoolExecutor(max_workers=min(8, max(1, len(expanded_queries)))) as executor:
+        with ThreadPoolExecutor(
+            max_workers=min(8, max(1, len(expanded_queries)))
+        ) as executor:
             future_to_query = {
-                executor.submit(self._hybrid_scores_concurrent, eq, vector_fn, fulltext_fn, k): eq
+                executor.submit(
+                    self._hybrid_scores_concurrent, eq, vector_fn, fulltext_fn, k
+                ): eq
                 for eq in expanded_queries
             }
             for future in as_completed(future_to_query):
@@ -147,8 +220,12 @@ class PlantBioRAG:
         return all_fused
 
     # One literature search branch for one expanded query
-    def _search_literature_one_query(self, expanded_query: str, k: int, max_chars_for_query: int) -> dict:
-        fused = self._hybrid_scores_concurrent(expanded_query, self._vector_chunks, self._fulltext_chunks, k)
+    def _search_literature_one_query(
+        self, expanded_query: str, k: int, max_chars_for_query: int
+    ) -> dict:
+        fused = self._hybrid_scores_concurrent(
+            expanded_query, self._vector_chunks, self._fulltext_chunks, k
+        )
         seed_cids = sorted(fused, key=lambda x: fused[x], reverse=True)[:k]
         seeded_chunks, expanded_chunks, triples = self._expand_hops(seed_cids)
         all_chunks_deduplicated = self._dedupe_chunks(seeded_chunks + expanded_chunks)
@@ -159,27 +236,33 @@ class PlantBioRAG:
                 continue
             if total_characters + len(text) > max_chars_for_query:
                 break
-            context_chunks.append({
-                "chunk_id": chunk.get("chunk_id"),
-                "source_path": chunk.get("source_path", ""),
-                "text": text
-            })
+            context_chunks.append(
+                {
+                    "chunk_id": chunk.get("chunk_id"),
+                    "source_path": chunk.get("source_path", ""),
+                    "text": text,
+                }
+            )
             total_characters += len(text)
         return {
             "expanded_query": expanded_query,
             "context_chunks": context_chunks,
-            "triples": triples[:MAX_TRIPLES]
+            "triples": triples[:MAX_TRIPLES],
         }
 
     # Run all expanded literature searches concurrently
-    def _get_literature_context_concurrent(self, expanded_queries: list[str], k: int, max_context_chars: int) -> str:
+    def _get_literature_context_concurrent(
+        self, expanded_queries: list[str], k: int, max_context_chars: int
+    ) -> str:
         if not expanded_queries:
             return ""
         max_chars_for_query = int(max_context_chars / max(1, len(expanded_queries)))
         results_by_query: dict[str, dict] = {}
         with ThreadPoolExecutor(max_workers=min(8, len(expanded_queries))) as executor:
             future_to_query = {
-                executor.submit(self._search_literature_one_query, eq, k, max_chars_for_query): eq
+                executor.submit(
+                    self._search_literature_one_query, eq, k, max_chars_for_query
+                ): eq
                 for eq in expanded_queries
             }
             for future in as_completed(future_to_query):
@@ -203,51 +286,65 @@ class PlantBioRAG:
                 added_chunk_keys.add(key)
                 context_chunks.append(f"[Source: {source_path}] {text}\n")
             triple_summ = "\n".join(result["triples"])
-            parts.append(f"""
-For sub-question
-{eq}
+            parts.append(
+                f"""
+                For sub-question
+                {eq}
 
-### Context Chunks are:
-{os.linesep.join(context_chunks)}
+                ### Context Chunks are:
+                {os.linesep.join(context_chunks)}
 
-### Entity Relationships are:
-{triple_summ}
-""")
+                ### Entity Relationships are:
+                {triple_summ}
+                """
+            )
         return "\n".join(parts)
 
-    # 2. Full-text indexing 
-    def _fulltext_chunks(self, q: str, k: int = QUERY_FULL_TEXT_MAX_CHUNKS) -> Dict[str, float]:
+    # 2. Full-text indexing
+    def _fulltext_chunks(
+        self, q: str, k: int = QUERY_FULL_TEXT_MAX_CHUNKS
+    ) -> Dict[str, float]:
         cleaned_q = self.escape_lucene_plain_text(q)
         if not cleaned_q:
             return {}
-        res = self.graph.query("""
+        res = self.graph.query(
+            """
             CALL db.index.fulltext.queryNodes('idx_chunk_text', $q) YIELD node, score
             RETURN node.chunk_id AS cid, score ORDER BY score DESC LIMIT $k
-        """, params={"q": cleaned_q, "k": k})
+        """,
+            params={"q": cleaned_q, "k": k},
+        )
         return {r["cid"]: r["score"] for r in res if r.get("cid")}
-    
+
     # Use Reciprocal Rank Fusion (RRF) instead of min-max normalized weights
-    def _rrf_fusion(self, vector_scores: Dict[str, float], ft_scores: Dict[str, float], k_penalty=60) -> Dict[str, float]:
+    def _rrf_fusion(
+        self, vector_scores: Dict[str, float], ft_scores: Dict[str, float], k_penalty=60
+    ) -> Dict[str, float]:
         rrf_scores = {}
         for rankings in [vector_scores, ft_scores]:
             # Sort by score descending to get rank
             sorted_items = sorted(rankings.items(), key=lambda x: x[1], reverse=True)
             for rank, (cid, _) in enumerate(sorted_items):
-                rrf_scores[cid] = rrf_scores.get(cid, 0.0) + (1.0 / (k_penalty + rank + 1))
+                rrf_scores[cid] = rrf_scores.get(cid, 0.0) + (
+                    1.0 / (k_penalty + rank + 1)
+                )
         return rrf_scores
-    
-    # Deduplicate chunks before reranking and prompt assembly. 
+
+    # Deduplicate chunks before reranking and prompt assembly.
     def _dedupe_chunks(self, chunks: List[dict]) -> List[dict]:
         seen = set()
         deduped = []
         for c in chunks:
-            key = (c.get("chunk_id") or (c.get("source_path", ""), c.get("text", "")[:200]))
+            key = c.get("chunk_id") or (
+                c.get("source_path", ""),
+                c.get("text", "")[:200],
+            )
             if key in seen:
                 continue
             seen.add(key)
             deduped.append(c)
         return deduped
-    
+
     # Helper for embedding rerank
     def _cosine_similarity(self, a: List[float], b: List[float]) -> float:
         if not a or not b or len(a) != len(b):
@@ -256,9 +353,9 @@ For sub-question
         norm = np.linalg.norm(va) * np.linalg.norm(vb)
         return float(np.dot(va, vb) / norm) if norm else 0.0
 
-    # 4. Expand from seed chunks to nodes and chunks. 
+    # 4. Expand from seed chunks to nodes and chunks.
     def _expand_hops(self, cids: List[str]):
-        # Fetch actual Triples (Node-Rel-Node) 
+        # Fetch actual Triples (Node-Rel-Node)
         query = """
         MATCH (c1:Chunk) WHERE c1.chunk_id IN $cids
         OPTIONAL MATCH (c1)-[:MENTIONS]->(n)
@@ -282,15 +379,19 @@ For sub-question
         if not res or not res[0]["seedchunks"]:
             return [], [], []
         # Filter out "None -[None]-> None" strings
-        triples = [t for t in res[0]["triples"] if t is not None] 
+        triples = [t for t in res[0]["triples"] if t is not None]
         return res[0]["seedchunks"], res[0]["expandedchunks"], triples
-    
+
     def _llm_invoke(self, prompt: Any) -> str:
         resp = self.llm.invoke(prompt)
-        return (getattr(resp, "text", None) or getattr(resp, "content", "") or str(resp)).strip()
-    
-    # Question analysis and retrieval query expansion 
-    def expand_question_and_queries(self, q: str) -> tuple[str, list[str], bool, str, str]:
+        return (
+            getattr(resp, "text", None) or getattr(resp, "content", "") or str(resp)
+        ).strip()
+
+    # Question analysis and retrieval query expansion
+    def expand_question_and_queries(
+        self, q: str
+    ) -> tuple[str, list[str], bool, str, str]:
         prompt = f"""
         You are a professional plant biology RAG expert.
         Given the user question in @@@@, do two tasks:
@@ -349,7 +450,9 @@ For sub-question
         data = json.loads(clean_json)
         expanded_question = str(data.get("expanded_question", q))
         expanded_queries = data.get("expanded_queries", [])
-        expanded_question = expanded_question.replace("/", " ").replace(":", " ").replace("\n", " ")
+        expanded_question = (
+            expanded_question.replace("/", " ").replace(":", " ").replace("\n", " ")
+        )
         expanded_queries = [
             str(s).replace("/", " ").replace(":", " ").replace("\n", " ")
             for s in expanded_queries
@@ -362,7 +465,13 @@ For sub-question
         is_agg_accession_query = bool(data.get("is_agg_accession_query", False))
         accession_question = str(data.get("accession_question", "")).strip()
         species = str(data.get("species", "")).strip()
-        return expanded_question, expanded_queries, is_agg_accession_query, accession_question, species
+        return (
+            expanded_question,
+            expanded_queries,
+            is_agg_accession_query,
+            accession_question,
+            species,
+        )
 
     def _extract_accessions(self, answer_text: str, species: str) -> List[str]:
         prompt = f"""You are a plant biology expert. From the text below, extract all plant variety names, cultivar names, accession names, and accession numbers (e.g. AGG-prefixed IDs, variety names like "Milan", "Kachu", etc.). Return ONLY a JSON array of strings. If none found, return [].
@@ -393,9 +502,9 @@ For sub-question
         If a string in the output list ends with LUPN, then keep LUPN. 
         e.g. AGG 41804 should become AGG 41804 LUPN. 
 
-Text:
-{answer_text}
-"""
+        Text:
+        {answer_text}
+        """
         raw = self._llm_invoke(prompt)
         # Strip markdown code fences if present
         raw = re.sub(r"^```[a-z]*\n?", "", raw).rstrip("```").strip()
@@ -405,20 +514,22 @@ Text:
         except Exception:
             # Fallback: extract quoted strings
             return re.findall(r'"([^"]+)"', raw)
-        
+
     # Call the accession API with extracted accession names
-    def _call_accession_api(self, question: str, accessions: List[str]) -> Optional[dict]:
+    def _call_accession_api(
+        self, question: str, accessions: List[str]
+    ) -> Optional[dict]:
         payload = {
             "token": ACCESSION_API_TOKEN,
             "question": question,
-            "accessions": accessions
+            "accessions": accessions,
         }
         try:
             response = requests.post(
                 ACCESSION_API_URL,
                 headers={"Content-Type": "application/json"},
                 json=payload,
-                timeout=ACCESSION_API_TIMEOUT
+                timeout=ACCESSION_API_TIMEOUT,
             )
             response.raise_for_status()
             return response.json()
@@ -431,52 +542,57 @@ Text:
         except Exception as e:
             logger.exception("Accession API unexpected error: %s", e)
         return None
-    
+
     # Use LLM to present accession API response clearly to the user
-    def _present_accession_results(self, original_question: str, api_response: dict) -> str:
+    def _present_accession_results(
+        self, original_question: str, api_response: dict
+    ) -> str:
         prompt = f"""You are a plant biology expert. 
         For user question, clearly and concisely present the AGG accession API results to the user. 
-For each accession queried, summarise whether it was found in the AGG and include its accession number(s), name(s), and institute if available. 
-Use a structured and readable format in response. 
-Barley and wheat Australian Grains Genebank (AGG) Accession_Number typically has this format. eg. AGG 495017 BARL, AGG 495017 WHEA 
-AWCC genebank is also part of AGG and has format as AUS+number. eg. AUS123456 
-Use entire AGG Accession_Number in the response. 
-If api results cannot answer part of user question, eg. Visualise in Pretzel, skip this part and do not answer. 
-Never make up answers. 
+        For each accession queried, summarise whether it was found in the AGG and include its accession number(s), name(s), and institute if available. 
+        Use a structured and readable format in response. 
+        Barley and wheat Australian Grains Genebank (AGG) Accession_Number typically has this format. eg. AGG 495017 BARL, AGG 495017 WHEA 
+        AWCC genebank is also part of AGG and has format as AUS+number. eg. AUS123456 
+        Use entire AGG Accession_Number in the response. 
+        If api results cannot answer part of user question, eg. Visualise in Pretzel, skip this part and do not answer. 
+        Never make up answers. 
 
 
-A user asked: "{original_question}". 
+        A user asked: "{original_question}". 
 
-The AGG accession API returned the following results:
-{api_response}
-"""
+        The AGG accession API returned the following results:
+        {api_response}
+        """
         resp = self._llm_invoke(prompt)
         return resp
-    
 
-    # 2. Metadata Graph RAG 
-    def _vector_chunks_metadata(self, q: str, k: int = QUERY_VECTOR_MAX_CHUNKS) -> Dict[str, float]:
-        # Vector search in metadata_graph via metadata_vector_index using Gemini embeddings. 
+    # 2. Metadata Graph RAG
+    def _vector_chunks_metadata(
+        self, q: str, k: int = QUERY_VECTOR_MAX_CHUNKS
+    ) -> Dict[str, float]:
+        # Vector search in metadata_graph via metadata_vector_index using Gemini embeddings.
         q_emb = self.emb.embed_query(q)
         res = self.graph.query(
             "CALL db.index.vector.queryNodes('metadata_vector_index', $k, $emb) "
             "YIELD node, score RETURN elementId(node) AS nid, score",
-            params={"k": k, "emb": q_emb}
+            params={"k": k, "emb": q_emb},
         )
         return {r["nid"]: r["score"] for r in res}
 
-    def _fulltext_chunks_metadata(self, q: str, k: int = QUERY_FULL_TEXT_MAX_CHUNKS) -> Dict[str, float]:
-        # Fulltext search in metadata_graph via metadata_fulltext_index. 
+    def _fulltext_chunks_metadata(
+        self, q: str, k: int = QUERY_FULL_TEXT_MAX_CHUNKS
+    ) -> Dict[str, float]:
+        # Fulltext search in metadata_graph via metadata_fulltext_index.
         cleaned_q = self.escape_lucene_plain_text(q)
         if not cleaned_q:
             return {}
         res = self.graph.query(
             "CALL db.index.fulltext.queryNodes('metadata_fulltext_index', $q) YIELD node, score "
             "RETURN elementId(node) AS nid, score ORDER BY score DESC LIMIT $k",
-            params={"q": cleaned_q, "k": k}
+            params={"q": cleaned_q, "k": k},
         )
         return {r["nid"]: r["score"] for r in res}
-    
+
     def _expand_one_hop(self, nids: List[str]):
         # Expand MetadataGraph seed nodes by 1 hop following any relationship, both directions.
         # Returns nodes with all properties plus chunk_id for dedupe/fetch.
@@ -514,40 +630,35 @@ The AGG accession API returned the following results:
         res = self.graph.query(query, params={"nids": nids})
         if not res or not res[0]["seedchunks"]:
             return [], [], []
-        seedchunks = [
-            c for c in res[0]["seedchunks"]
-            if c and c.get("chunk_id")
-        ]
+        seedchunks = [c for c in res[0]["seedchunks"] if c and c.get("chunk_id")]
         expandedchunks = [
-            c for c in res[0]["expandedchunks"]
-            if c and c.get("chunk_id")
+            c for c in res[0]["expandedchunks"] if c and c.get("chunk_id")
         ]
-        triples = [
-            t for t in res[0]["triples"]
-            if t is not None
-        ]
+        triples = [t for t in res[0]["triples"] if t is not None]
         return seedchunks, expandedchunks, triples
 
-    def _search_metadata_hybrid(self, expanded_queries: list[str], max_chars: int = METADATA_MAX_CHARACTERS) -> str:
+    def _search_metadata_hybrid(
+        self, expanded_queries: list[str], max_chars: int = METADATA_MAX_CHARACTERS
+    ) -> str:
         # Hybrid search for metadata_graph.
-        # Run expanded-query metadata hybrid searches concurrently. 
-        # Each query also runs vector + full-text concurrently. 
+        # Run expanded-query metadata hybrid searches concurrently.
+        # Each query also runs vector + full-text concurrently.
         all_fused = self._multi_query_hybrid_scores_concurrent(
             expanded_queries,
             self._vector_chunks_metadata,
             self._fulltext_chunks_metadata,
-            QUERY_VECTOR_MAX_CHUNKS
+            QUERY_VECTOR_MAX_CHUNKS,
         )
         # Sort by fused score descending
-        top_nids = sorted(all_fused, key=lambda x: all_fused[x], reverse=True)[:MAX_METADATA_CHUNKS]
+        top_nids = sorted(all_fused, key=lambda x: all_fused[x], reverse=True)[
+            :MAX_METADATA_CHUNKS
+        ]
         if not top_nids:
             return ""
         seeded_chunks, expanded_chunks, triples = self._expand_one_hop(top_nids)
         all_chunks_deduplicated = self._dedupe_chunks(seeded_chunks + expanded_chunks)
         deduped_nids = [
-            c.get("chunk_id")
-            for c in all_chunks_deduplicated
-            if c.get("chunk_id")
+            c.get("chunk_id") for c in all_chunks_deduplicated if c.get("chunk_id")
         ]
         fetch_nids = deduped_nids or top_nids
         res = self.graph.query(
@@ -559,10 +670,10 @@ The AGG accession API returned the following results:
             RETURN i, n {.*} AS props
             ORDER BY i
             """,
-            params={"nids": fetch_nids}
+            params={"nids": fetch_nids},
         )
-        # Limit by max_chars. 
-        context_parts, total_chars = [], 0        
+        # Limit by max_chars.
+        context_parts, total_chars = [], 0
         for t in triples[:MAX_TRIPLES]:
             text = json.dumps({"relationship": t}, ensure_ascii=False)
             if total_chars + len(text) > max_chars:
@@ -570,15 +681,18 @@ The AGG accession API returned the following results:
             context_parts.append(text)
             total_chars += len(text)
         for r in res:
-            props = {k: v for k, v in r["props"].items()
-                     if k != "embedding" and v is not None}
+            props = {
+                k: v
+                for k, v in r["props"].items()
+                if k != "embedding" and v is not None
+            }
             text = json.dumps(props)
             if total_chars + len(text) > max_chars:
                 break
             context_parts.append(text)
             total_chars += len(text)
         return "\n".join(context_parts)
-    
+
     def _get_metadata_context(self, query: str, expanded_queries: list[str]) -> str:
         context_parts = []
         result = self._search_metadata_hybrid(expanded_queries)
@@ -586,29 +700,35 @@ The AGG accession API returned the following results:
             context_parts.append(f"### Metadata Graph (Hybrid Search):\n{result}")
         return "\n\n".join(context_parts)
 
-    def _vector_chunks_pretzel(self, q: str, k: int = QUERY_VECTOR_MAX_CHUNKS) -> Dict[str, float]:
-        # Vector search in pretzel_graph using Gemini embeddings. 
+    def _vector_chunks_pretzel(
+        self, q: str, k: int = QUERY_VECTOR_MAX_CHUNKS
+    ) -> Dict[str, float]:
+        # Vector search in pretzel_graph using Gemini embeddings.
         q_emb = self.emb.embed_query(q)
         res = self.graph.query(
             "CALL db.index.vector.queryNodes('pretzel_functions_vector', $k, $emb) "
             "YIELD node, score RETURN elementId(node) AS nid, score",
-            params={"k": k, "emb": q_emb}
+            params={"k": k, "emb": q_emb},
         )
         return {r["nid"]: r["score"] for r in res}
 
-    def _fulltext_chunks_pretzel(self, q: str, k: int = QUERY_FULL_TEXT_MAX_CHUNKS) -> Dict[str, float]:
-        # Fulltext search in pretzel_graph. 
+    def _fulltext_chunks_pretzel(
+        self, q: str, k: int = QUERY_FULL_TEXT_MAX_CHUNKS
+    ) -> Dict[str, float]:
+        # Fulltext search in pretzel_graph.
         cleaned_q = self.escape_lucene_plain_text(q)
         if not cleaned_q:
             return {}
         res = self.graph.query(
             "CALL db.index.fulltext.queryNodes('idx_pretzel_function_text', $q) YIELD node, score "
             "RETURN elementId(node) AS nid, score ORDER BY score DESC LIMIT $k",
-            params={"q": cleaned_q, "k": k}
+            params={"q": cleaned_q, "k": k},
         )
         return {r["nid"]: r["score"] for r in res}
-    
-    def _get_pretzel_context(self, expanded_queries: list[str], max_chars: int = METADATA_MAX_CHARACTERS) -> str:
+
+    def _get_pretzel_context(
+        self, expanded_queries: list[str], max_chars: int = METADATA_MAX_CHARACTERS
+    ) -> str:
         # Hybrid search for pretzel_graph.
         # Run expanded-query Pretzel hybrid searches concurrently
         # Each query also runs vector + full-text concurrently
@@ -616,56 +736,90 @@ The AGG accession API returned the following results:
             expanded_queries,
             self._vector_chunks_pretzel,
             self._fulltext_chunks_pretzel,
-            QUERY_VECTOR_MAX_CHUNKS
+            QUERY_VECTOR_MAX_CHUNKS,
         )
         # Sort by fused score descending
         top_nids = sorted(all_fused, key=lambda x: all_fused[x], reverse=True)[:50]
         if not top_nids:
             return ""
-        # Fetch full node properties 
+        # Fetch full node properties
         res = self.graph.query(
             """UNWIND $nids AS nid
             MATCH (p:PretzelFunction) WHERE elementId(p) = nid 
             RETURN p {.*} AS props""",
-            params={"nids": top_nids}
+            params={"nids": top_nids},
         )
         # Limit by total_characters = 10000
         context_parts, total_chars = [], 0
         exclude_keys = {"embedding", "id", "chunk_id"}
         for r in res:
-            props = {k: v for k, v in r["props"].items()
-                     if k not in exclude_keys and v is not None}
+            props = {
+                k: v
+                for k, v in r["props"].items()
+                if k not in exclude_keys and v is not None
+            }
             text = json.dumps(props)
             if total_chars + len(text) > max_chars:
                 break
             context_parts.append(text)
             total_chars += len(text)
         return "\n".join(context_parts)
-    
 
-    # Main query 
-    def query(self, q: str, k: int = QUERY_MAX_CHUNKS, max_context_chars: int = MAX_CHARACTERS) -> tuple[str, str, dict]:
-        logger.info(f"Start query.")
-        start_time = time.perf_counter()        
-        try:
-            expanded_question, expanded_queries, is_agg_accession_query, accession_question, species = self.expand_question_and_queries(q)
-            logger.info(f"expanded_question: {expanded_question}")
-            logger.info(f"expanded_queries: {expanded_queries}")
-            logger.info(f"is_agg_accession_query: {is_agg_accession_query}")
-            logger.info(f"accession_question: {accession_question}")
-            logger.info(f"species: {species}")
-            logger.info(f"Start query.")
-        except Exception as e:
-            logger.warning("Question and query expansion failed: %s", e)
-            expanded_question = q
-            expanded_queries = [q]
-            is_agg_accession_query = False
-            accession_question = ""
-            species = ""
-        end_time = time.perf_counter()
-        logger.info(f"1. Analysis of question: {end_time - start_time:0.1f} sec.")
+    # --- Step helpers for query() -------------------------------------
+    # Each helper below does the "real work" for one stage of the pipeline
+    # and either returns plain data or raises. `query()` itself stays
+    # responsible for all `yield`ing (stage changes / text / result), and
+    # decides - per stage - whether a failure here should be fatal (abort
+    # the whole run) or recoverable (degrade gracefully and keep going).
 
-        prompt = global_instruction_and_information + f"""\n\n\nYou are a plant biology RAG expert. 
+    # Stage: RETRIEVING_CONTEXT. Non-fatal: each of the three sources is
+    # caught independently, so e.g. a Neo4j hiccup on the metadata graph
+    # doesn't prevent literature context (or the whole answer) from coming
+    # back. A failed source just contributes an empty string.
+    def _retrieve_context(
+        self, q: str, expanded_queries: List[str], k: int, max_context_chars: int
+    ) -> Tuple[str, str, str]:
+        def safe_call(fn, label, *args):
+            try:
+                return fn(*args)
+            except Exception as e:
+                logger.warning("%s context retrieval failed: %s", label, e)
+                return ""
+
+        with ThreadPoolExecutor(max_workers=3) as executor:
+            literature_future = executor.submit(
+                safe_call,
+                self._get_literature_context_concurrent,
+                "Literature",
+                expanded_queries,
+                k,
+                max_context_chars,
+            )
+            metadata_future = executor.submit(
+                safe_call, self._get_metadata_context, "Metadata", q, expanded_queries
+            )
+            pretzel_future = None
+            if "pretzel" in q.lower():
+                pretzel_future = executor.submit(
+                    safe_call, self._get_pretzel_context, "Pretzel", expanded_queries
+                )
+            literature_context = literature_future.result()
+            metadata_context = metadata_future.result()
+            pretzel_context = pretzel_future.result() if pretzel_future else ""
+        return literature_context, metadata_context, pretzel_context
+
+    # Pure string assembly - no I/O, so nothing to catch here.
+    def _build_answer_prompt(
+        self,
+        expanded_question: str,
+        q: str,
+        literature_context: str,
+        metadata_context: str,
+        pretzel_context: str,
+    ) -> str:
+        prompt = (
+            global_instruction_and_information
+            + f"""\n\n\nYou are a plant biology RAG expert. 
         read the provided context. 
         read user question in @@@@. 
 
@@ -690,7 +844,7 @@ The AGG accession API returned the following results:
 
         Do not infer beyond the retrieved context. 
         Prefer concise and direct answers. 
-        
+    
         If useful, structure answer as:
         1. Answer
         2. Evidence
@@ -701,35 +855,17 @@ The AGG accession API returned the following results:
         Chromosome-level evidence from literature, trait associations, or another assembly does not prove the marker has a position in the requested assembly. 
         If the marker is annotated only in another assembly, label that assembly as the source assembly and say the requested assembly coordinate is not available in the retrieved context. 
         """
-
-        # Run literature, metadata, and Pretzel context retrieval concurrently. 
-        start_time = time.perf_counter()
-        with ThreadPoolExecutor(max_workers=3) as executor:
-            literature_future = executor.submit(self._get_literature_context_concurrent, expanded_queries, k, max_context_chars)
-            metadata_future = executor.submit(self._get_metadata_context, q, expanded_queries)
-            pretzel_future = None
-            if "pretzel" in q.lower():
-                pretzel_future = executor.submit(self._get_pretzel_context, expanded_queries)
-            literature_context = literature_future.result()
-            metadata_context = metadata_future.result()
-            pretzel_context = pretzel_future.result() if pretzel_future else ""
+        )
         if literature_context:
             prompt += literature_context
         if metadata_context:
             prompt += f"""\n\n\n
-### [Source: Metadata Graph]:
-{metadata_context}"""
+        ### [Source: Metadata Graph]:
+        {metadata_context}"""
         if pretzel_context:
             prompt += f"""\n\n\n
-### [Source: Pretzel Documentation]:
-{pretzel_context}"""
-        end_time = time.perf_counter()
-        logger.info(
-            "2. Concurrent retrieval: literature + metadata + Pretzel context: %.1f sec.",
-            end_time - start_time
-        )
-        
-        # 3: Answer user question based on all retrived context. 
+        ### [Source: Pretzel Documentation]:
+        {pretzel_context}"""
         prompt += f"""
 
 
@@ -742,57 +878,231 @@ The AGG accession API returned the following results:
             {q}
             @@@@
             Answer:"""
-        
-        start_time = time.perf_counter()
-        resp = self.llm.invoke(prompt)
-        answer = (getattr(resp, "text", None) or getattr(resp, "content", "") or str(resp)).strip()
-        usage_metadata = getattr(resp, "usage_metadata", {}) or {}
-        end_time = time.perf_counter()
-        logger.info(f"4. Call LLM to answer: {end_time - start_time:0.1f} sec.")
+        return prompt
 
-        if is_agg_accession_query and not species:
-            species = input("Please specify the species (e.g. wheat, barley, oat, chickpea): ").strip()
-            accession_question = f"Are these {species} accessions in AGG?"
-            logger.info("Updated accession_question: %s", accession_question)
-        if is_agg_accession_query:
-            logger.info("[AGG Accession Query Detected] Extracting accessions from RAG answer...")
+    # Stage: GENERATING_ANSWER. Fatal by design: with no answer, there is
+    # nothing useful left to yield, so `query()` lets this propagate up to
+    # its outer `except` and end the run with an `ErrorEvent`.
+    def _generate_answer(self, prompt: Any) -> Tuple[str, dict]:
+        resp = self.llm.invoke(prompt)
+        answer = (
+            getattr(resp, "text", None) or getattr(resp, "content", "") or str(resp)
+        ).strip()
+        usage_metadata = getattr(resp, "usage_metadata", {}) or {}
+        return answer, usage_metadata
+
+    # Stages: CHECKING_AGG_ACCESSIONS. Extraction can itself fail (it calls
+    # the LLM); `query()` catches that at the call site and treats it the
+    # same as "no accessions found", since the main answer has already been
+    # produced and shouldn't be thrown away over an optional side lookup.
+    # `_call_accession_api` already degrades to `None` internally on
+    # network/HTTP errors, so it's safe to call directly here.
+    def _lookup_agg_accessions(
+        self, q: str, answer: str, species: str, accession_question: str
+    ) -> Tuple[List[str], Optional[dict]]:
+        logger.info(
+            "[AGG Accession Query Detected] Extracting accessions from RAG answer..."
+        )
+        start_time = time.perf_counter()
+        accessions = self._extract_accessions(
+            f"User question:\n{q}\n\nRAG answer:\n{answer}", species
+        )
+        end_time = time.perf_counter()
+        logger.info(f"6. Extract accessions: {end_time - start_time:0.1f} sec.")
+        logger.info("[Extracted Accessions]: %s", accessions)
+
+        api_response = None
+        if accessions:
             start_time = time.perf_counter()
-            accessions = self._extract_accessions(f"User question:\n{q}\n\nRAG answer:\n{answer}", species)
+            api_response = self._call_accession_api(accession_question, accessions)
             end_time = time.perf_counter()
-            logger.info(f"6. Extract accessions: {end_time - start_time:0.1f} sec.")
-            logger.info("[Extracted Accessions]: %s", accessions)
-            if accessions:
-                start_time = time.perf_counter()
-                api_response = self._call_accession_api(accession_question, accessions)
-                end_time = time.perf_counter()
-                logger.info(f"7. Call accession API: {end_time - start_time:0.1f} sec.")
-                logger.info(f"api_response: {api_response}")
-                if api_response:
-                    logger.info("[Accession API response received] Presenting to user via LLM...")
-                    logger.debug("Accession API response: %s", api_response)
-                    start_time = time.perf_counter()
-                    accession_summary = self._present_accession_results(q, api_response)
-                    end_time = time.perf_counter()
-                    logger.info(f"8. Summarise and present accession results: {end_time - start_time:0.1f} sec.")
-                    # Append accession lookup results to the main answer
-                    answer = answer + "\n\n---\n\n**Australian Grains Genebank (AGG) Accession Lookup:**\n" + accession_summary
+            logger.info(f"7. Call accession API: {end_time - start_time:0.1f} sec.")
+            logger.info(f"api_response: {api_response}")
+        return accessions, api_response
+
+    # Main query
+    # Single-turn only: `q` is the latest user message. No prior conversation
+    # history is accepted or used to drive expansion/retrieval/generation.
+    #
+    # Async generator: yields protocol-agnostic internal events (stage
+    # changes, text output, final result/error) as the run progresses,
+    # instead of computing everything and returning once. Preserves all
+    # existing retrieval/generation logic unchanged; only the control flow
+    # differs. The LLM call is not yet streamed (see Step 5) and blocking
+    # calls are not yet offloaded to a thread (see Step 7), so this still
+    # blocks the event loop internally.
+    #
+    # Error handling policy, by stage:
+    # - EXPANDING_QUESTION: recoverable. Falls back to the raw question
+    #   and "not an accession query" so the run can still proceed.
+    # - RETRIEVING_CONTEXT: recoverable per-source (see _retrieve_context).
+    # - GENERATING_ANSWER: fatal. No answer means nothing left to give the
+    #   caller, so this is allowed to propagate to the outer except below.
+    # - CHECKING_AGG_ACCESSIONS / PRESENTING_ACCESSIONS: recoverable. These
+    #   run only after the main answer has already been yielded, so a
+    #   failure here is reported inline as a TextEvent and the run still
+    #   ends with a successful ResultEvent rather than an ErrorEvent.
+    async def query(
+        self, q: str, k: int = QUERY_MAX_CHUNKS, max_context_chars: int = MAX_CHARACTERS
+    ) -> AsyncGenerator[RunEvent, None]:
+        logger.info(f"Start query.")
+        state = RunState(stage=Stage.EXPANDING_QUESTION)
+        try:
+            start_time = time.perf_counter()
+            try:
+                (
+                    expanded_question,
+                    expanded_queries,
+                    is_agg_accession_query,
+                    accession_question,
+                    species,
+                ) = self.expand_question_and_queries(q)
+            except Exception as e:
+                logger.warning("Question and query expansion failed: %s", e)
+                expanded_question = q
+                expanded_queries = [q]
+                is_agg_accession_query = False
+                accession_question = ""
+                species = ""
+            end_time = time.perf_counter()
+            logger.info(f"1. Analysis of question: {end_time - start_time:0.1f} sec.")
+
+            state = state.model_copy(
+                update={
+                    "expanded_question": expanded_question,
+                    "species": species,
+                    "is_agg_accession_query": is_agg_accession_query,
+                }
+            )
+            yield StageChangeEvent(state=state)
+
+            state = state.model_copy(update={"stage": Stage.RETRIEVING_CONTEXT})
+            yield StageChangeEvent(state=state)
+
+            # Run literature, metadata, and Pretzel context retrieval concurrently.
+            start_time = time.perf_counter()
+            literature_context, metadata_context, pretzel_context = (
+                self._retrieve_context(q, expanded_queries, k, max_context_chars)
+            )
+            end_time = time.perf_counter()
+            logger.info(
+                "2. Concurrent retrieval: literature + metadata + Pretzel context: %.1f sec.",
+                end_time - start_time,
+            )
+
+            prompt = self._build_answer_prompt(
+                expanded_question,
+                q,
+                literature_context,
+                metadata_context,
+                pretzel_context,
+            )
+
+            state = state.model_copy(update={"stage": Stage.GENERATING_ANSWER})
+            yield StageChangeEvent(state=state)
+
+            start_time = time.perf_counter()
+            answer, usage_metadata = self._generate_answer(prompt)
+            end_time = time.perf_counter()
+            logger.info(f"4. Call LLM to answer: {end_time - start_time:0.1f} sec.")
+
+            state = state.model_copy(update={"usage_metadata": usage_metadata})
+            yield TextEvent(text=answer)
+
+            if is_agg_accession_query and not species:
+                species = input(
+                    "Please specify the species (e.g. wheat, barley, oat, chickpea): "
+                ).strip()
+                accession_question = f"Are these {species} accessions in AGG?"
+                logger.info("Updated accession_question: %s", accession_question)
+                state = state.model_copy(update={"species": species})
+            if is_agg_accession_query:
+                state = state.model_copy(
+                    update={"stage": Stage.CHECKING_AGG_ACCESSIONS}
+                )
+                yield StageChangeEvent(state=state)
+
+                try:
+                    accessions, api_response = self._lookup_agg_accessions(
+                        q, answer, species, accession_question
+                    )
+                except Exception as e:
+                    logger.exception("AGG accession lookup failed: %s", e)
+                    accessions, api_response = [], None
+
+                state = state.model_copy(update={"accessions": accessions})
+                if accessions:
+                    if api_response:
+                        logger.info(
+                            "[Accession API response received] Presenting to user via LLM..."
+                        )
+                        logger.debug("Accession API response: %s", api_response)
+
+                        state = state.model_copy(
+                            update={"stage": Stage.PRESENTING_ACCESSIONS}
+                        )
+                        yield StageChangeEvent(state=state)
+
+                        start_time = time.perf_counter()
+                        try:
+                            accession_summary = self._present_accession_results(
+                                q, api_response
+                            )
+                        except Exception as e:
+                            logger.exception(
+                                "Presenting accession results failed: %s", e
+                            )
+                            accession_summary = f"(Could not summarise results; raw API response: {api_response})"
+                        end_time = time.perf_counter()
+                        logger.info(
+                            f"8. Summarise and present accession results: {end_time - start_time:0.1f} sec."
+                        )
+                        yield TextEvent(
+                            text="\n\n---\n\n**Australian Grains Genebank (AGG) Accession Lookup:**\n"
+                            + accession_summary
+                        )
+                    else:
+                        yield TextEvent(
+                            text="\n\n[AGG accession lookup failed — API unavailable or returned no data.]"
+                        )
                 else:
-                    answer += "\n\n[AGG accession lookup failed — API unavailable or returned no data.]"
-            else:
-                answer += "\n\n[No accession names could be extracted from the RAG answer to query the AGG API.]"
-        return expanded_question, answer, usage_metadata
+                    yield TextEvent(
+                        text="\n\n[No accession names could be extracted from the RAG answer to query the AGG API.]"
+                    )
+
+            yield ResultEvent(state=state)
+        except Exception as e:
+            logger.exception("query() failed: %s", e)
+            yield ErrorEvent(state=state.model_copy(update={"error": str(e)}))
+
 
 def main():
     # Set up argument parsing
     parser = argparse.ArgumentParser(description="Plant Biology RAG Pipeline")
-    parser.add_argument("query", type=str, help="The question you want to ask the RAG pipeline")
+    parser.add_argument(
+        "query", type=str, help="The question you want to ask the RAG pipeline"
+    )
     args = parser.parse_args()
 
     rag = PlantBioRAG()
 
-    expanded_question, answer, tokens = rag.query(args.query)
+    async def _run():
+        answer_parts = []
+        final_state = None
+        async for event in rag.query(args.query):
+            if isinstance(event, TextEvent):
+                answer_parts.append(event.text)
+            elif isinstance(event, (ResultEvent, ErrorEvent)):
+                final_state = event.state
+        return "".join(answer_parts), final_state
+
+    answer, final_state = asyncio.run(_run())
     logger.info("Final Answer:\n%s", answer)
-    logger.info("Token Usage: %s", str(tokens))
+    if final_state is not None:
+        if final_state.error:
+            logger.error("Run error: %s", final_state.error)
+        logger.info("Token Usage: %s", str(final_state.usage_metadata))
+
 
 if __name__ == "__main__":
     main()
