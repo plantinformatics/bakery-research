@@ -48,6 +48,11 @@ ACCESSION_API_TIMEOUT = 120
 
 METADATA_MAX_CHARACTERS = 300000
 
+SEMANTIC_CACHE_INDEX = "semantic_cache_vector"
+SEMANTIC_CACHE_THRESHOLD = 0.92
+SEMANTIC_CACHE_TOP_K = 1
+SEMANTIC_CACHE_TTL_DAYS = 14
+
 global_instruction_and_information = """
 You are an expert of a plant biology organisation. 
 Background information: 
@@ -100,6 +105,25 @@ class PlantBioRAG:
                               node_label="Chunk", text_node_property="text",
                               embedding_node_property="embedding", 
                               index_name="vector")
+        self._clear_expired_semantic_cache()
+
+    def _clear_expired_semantic_cache(self) -> None:
+        try:
+            res = self.graph.query(
+                """
+                MATCH (c:SemanticCache)
+                WHERE c.created_at IS NOT NULL
+                  AND c.created_at < datetime() - duration({days: $ttl_days})
+                WITH collect(c) AS expired, count(c) AS deleted_count
+                FOREACH (n IN expired | DETACH DELETE n)
+                RETURN deleted_count
+                """,
+                params={"ttl_days": SEMANTIC_CACHE_TTL_DAYS}
+            )
+            deleted_count = res[0]["deleted_count"] if res else 0
+            logger.info("Cleared expired semantic cache entries: %s", deleted_count)
+        except Exception as e:
+            logger.warning("Failed to clear expired semantic cache entries: %s", e)
     
     # 1. Literature Graph RAG 
     # 1. Vector indexing 
@@ -644,10 +668,118 @@ The AGG accession API returned the following results:
         return "\n".join(context_parts)
     
 
+    def _semantic_cache_lookup(self, q_emb) -> Optional[tuple[str, str, dict]]:
+        res = self.graph.query(
+        """
+        CALL db.index.vector.queryNodes($index, $k, $emb)
+        YIELD node, score
+        WHERE score >= $threshold
+          AND node.created_at IS NOT NULL
+          AND node.created_at >= datetime() - duration({days: $ttl_days})
+        RETURN node.question AS question,
+               node.expanded_question AS expanded_question,
+               node.answer AS answer,
+               node.usage_metadata AS usage_metadata,
+               score
+        ORDER BY score DESC
+        LIMIT 1
+        """,
+        params={
+            "index": SEMANTIC_CACHE_INDEX,
+            "k": SEMANTIC_CACHE_TOP_K,
+            "emb": q_emb,
+            "threshold": SEMANTIC_CACHE_THRESHOLD,
+            "ttl_days": SEMANTIC_CACHE_TTL_DAYS,
+        })
+        if not res:
+            return None
+        r = res[0]
+        logger.info("Semantic cache hit: score=%s question=%s", r["score"], r["question"])
+        usage = {}
+        try:
+            usage = json.loads(r.get("usage_metadata") or "{}")
+        except Exception:
+            pass
+        return r["expanded_question"], r["answer"], usage
+
+    def _semantic_cache_store(self, q: str, expanded_question: str, answer: str, usage_metadata: dict, q_emb) -> None:
+        self.graph.query(
+        """
+        CREATE (c:SemanticCache {
+            question: $question,
+            expanded_question: $expanded_question,
+            answer: $answer,
+            usage_metadata: $usage_metadata,
+            embedding: $embedding,
+            created_at: datetime()
+        })
+        """,
+        params={
+            "question": q,
+            "expanded_question": expanded_question,
+            "answer": answer,
+            "usage_metadata": json.dumps(usage_metadata),
+            "embedding": q_emb,
+        })
+    
+
     # Main query 
     def query(self, q: str, k: int = QUERY_MAX_CHUNKS, max_context_chars: int = MAX_CHARACTERS) -> tuple[str, str, dict]:
         logger.info(f"Start query.")
-        start_time = time.perf_counter()        
+        start_time = time.perf_counter()
+
+        q_emb = self.emb.embed_query(q)
+        cached = self._semantic_cache_lookup(q_emb)
+        if cached:
+            (cached_expanded_question, cached_answer, cached_usage) = cached
+            prompt = global_instruction_and_information + f"""
+            You are a plant biology RAG expert. 
+        read the provided context. 
+        read user question in @@@@. 
+
+        if a piece of provided context is contradictory or irrelevant to the user question, ignore it. 
+        if a piece of provided context directly supports answer to user question, keep it. 
+
+        concisely and directly answer user question in @@@@ based ONLY on the previous answer with a very similar question in ####. 
+
+        Keep citation of sources after facts by appending [Source: ]. 
+        Do not include [Source: Previous Answer] in response.  
+        Do not make up content in answer. 
+
+        Do not infer beyond the retrieved context. 
+        Prefer concise and direct answers. 
+        
+        If useful, structure answer as:
+        1. Answer
+        2. Evidence
+        3. Limitations / missing information
+
+        Never assume genomic coordinates, chromosome assignments, or marker locations are transferable between assemblies. 
+        Before reporting that a marker is located in the requested assembly, verify that the marker is explicitly annotated in that exact assembly in the retrieved context. 
+        Chromosome-level evidence from literature, trait associations, or another assembly does not prove the marker has a position in the requested assembly. 
+        If the marker is annotated only in another assembly, label that assembly as the source assembly and say the requested assembly coordinate is not available in the retrieved context. 
+
+            User Question:
+            @@@@
+            {q}
+            @@@@
+
+            Previous answer to a similar question: 
+            ####
+            {cached_answer}
+            ####
+
+            Answer:"""
+        
+            start_time = time.perf_counter()
+            resp = self.llm.invoke(prompt)
+            answer = (getattr(resp, "text", None) or getattr(resp, "content", "") or str(resp)).strip()
+            usage_metadata = getattr(resp, "usage_metadata", {}) or {}
+            end_time = time.perf_counter()
+            logger.info(f"4. Use LLM and previous cached answer to answer: {end_time - start_time:0.1f} sec.")
+            return cached_expanded_question, answer, usage_metadata
+        
+
         try:
             expanded_question, expanded_queries, is_agg_accession_query, accession_question, species = self.expand_question_and_queries(q)
             logger.info(f"expanded_question: {expanded_question}")
@@ -781,6 +913,7 @@ The AGG accession API returned the following results:
                     answer += "\n\n[AGG accession lookup failed — API unavailable or returned no data.]"
             else:
                 answer += "\n\n[No accession names could be extracted from the RAG answer to query the AGG API.]"
+        self._semantic_cache_store(q, expanded_question, answer, usage_metadata, q_emb)
         return expanded_question, answer, usage_metadata
 
 def main():
