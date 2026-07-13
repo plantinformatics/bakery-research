@@ -16,8 +16,6 @@ import logging
 import time
 from enum import Enum
 from pydantic import BaseModel, Field
-from langchain_core.prompts import PromptTemplate
-from neo4j.graph import Node, Relationship, Path
 import numpy as np
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -31,6 +29,11 @@ logging.getLogger("google_genai").setLevel(logging.WARNING)
 logging.getLogger("google_genai.models").setLevel(logging.WARNING)
 logging.getLogger("langchain").setLevel(logging.WARNING)
 logging.getLogger("neo4j").setLevel(logging.WARNING)
+# Server-side query notifications (e.g. deprecation notices) are logged by the
+# driver via this dedicated logger regardless of the "neo4j" logger's level.
+logging.getLogger("neo4j.notifications").setLevel(
+    logging.ERROR
+)  # comment out in future if fixed upstream
 logger = logging.getLogger(__name__)
 
 GEMINI_MODEL = "gemini-3-flash-preview"
@@ -382,11 +385,28 @@ class PlantBioRAG:
         triples = [t for t in res[0]["triples"] if t is not None]
         return res[0]["seedchunks"], res[0]["expandedchunks"], triples
 
+    # Extracts plain text from an LLM response/chunk. `.content` is usually
+    # a plain string, but some providers (e.g. Gemini) can return a list of
+    # content blocks instead, so that case is flattened here too.
+    @staticmethod
+    def _message_text(resp: Any) -> str:
+        text = getattr(resp, "text", None)
+        if isinstance(text, str) and text:
+            return text
+        content = getattr(resp, "content", "")
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            return "".join(
+                part.get("text", "") if isinstance(part, dict) else str(part)
+                for part in content
+                if part
+            )
+        return str(content) if content else str(resp)
+
     def _llm_invoke(self, prompt: Any) -> str:
         resp = self.llm.invoke(prompt)
-        return (
-            getattr(resp, "text", None) or getattr(resp, "content", "") or str(resp)
-        ).strip()
+        return self._message_text(resp).strip()
 
     # Question analysis and retrieval query expansion
     def expand_question_and_queries(
@@ -573,8 +593,9 @@ class PlantBioRAG:
         # Vector search in metadata_graph via metadata_vector_index using Gemini embeddings.
         q_emb = self.emb.embed_query(q)
         res = self.graph.query(
-            "CALL db.index.vector.queryNodes('metadata_vector_index', $k, $emb) "
-            "YIELD node, score RETURN elementId(node) AS nid, score",
+            "CYPHER 25 MATCH (n:MetadataGraph) "
+            "SEARCH n IN (VECTOR INDEX metadata_vector_index FOR $emb LIMIT $k) SCORE AS score "
+            "RETURN elementId(n) AS nid, score",
             params={"k": k, "emb": q_emb},
         )
         return {r["nid"]: r["score"] for r in res}
@@ -706,8 +727,9 @@ class PlantBioRAG:
         # Vector search in pretzel_graph using Gemini embeddings.
         q_emb = self.emb.embed_query(q)
         res = self.graph.query(
-            "CALL db.index.vector.queryNodes('pretzel_functions_vector', $k, $emb) "
-            "YIELD node, score RETURN elementId(node) AS nid, score",
+            "CYPHER 25 MATCH (n:PretzelFunction) "
+            "SEARCH n IN (VECTOR INDEX pretzel_functions_vector FOR $emb LIMIT $k) SCORE AS score "
+            "RETURN elementId(n) AS nid, score",
             params={"k": k, "emb": q_emb},
         )
         return {r["nid"]: r["score"] for r in res}
@@ -882,14 +904,12 @@ class PlantBioRAG:
 
     # Stage: GENERATING_ANSWER. Fatal by design: with no answer, there is
     # nothing useful left to yield, so `query()` lets this propagate up to
-    # its outer `except` and end the run with an `ErrorEvent`.
-    def _generate_answer(self, prompt: Any) -> Tuple[str, dict]:
-        resp = self.llm.invoke(prompt)
-        answer = (
-            getattr(resp, "text", None) or getattr(resp, "content", "") or str(resp)
-        ).strip()
-        usage_metadata = getattr(resp, "usage_metadata", {}) or {}
-        return answer, usage_metadata
+    # its outer `except` and end the run with an `ErrorEvent`. Streams the
+    # response via `llm.astream` so `query()` can yield text chunks as they
+    # arrive instead of blocking for the full answer.
+    async def _generate_answer_stream(self, prompt: Any) -> AsyncGenerator[Any, None]:
+        async for chunk in self.llm.astream(prompt):
+            yield chunk
 
     # Stages: CHECKING_AGG_ACCESSIONS. Extraction can itself fail (it calls
     # the LLM); `query()` catches that at the call site and treats it the
@@ -1002,12 +1022,20 @@ class PlantBioRAG:
             yield StageChangeEvent(state=state)
 
             start_time = time.perf_counter()
-            answer, usage_metadata = self._generate_answer(prompt)
+            answer_parts = []
+            full_chunk = None
+            async for chunk in self._generate_answer_stream(prompt):
+                full_chunk = chunk if full_chunk is None else full_chunk + chunk
+                text = self._message_text(chunk)
+                if text:
+                    answer_parts.append(text)
+                    yield TextEvent(text=text)
             end_time = time.perf_counter()
             logger.info(f"4. Call LLM to answer: {end_time - start_time:0.1f} sec.")
 
+            answer = "".join(answer_parts).strip()
+            usage_metadata = getattr(full_chunk, "usage_metadata", {}) or {}
             state = state.model_copy(update={"usage_metadata": usage_metadata})
-            yield TextEvent(text=answer)
 
             if is_agg_accession_query and not species:
                 species = input(
@@ -1089,8 +1117,11 @@ def main():
     async def _run():
         answer_parts = []
         final_state = None
+        start_time = time.perf_counter()
         async for event in rag.query(args.query):
             if isinstance(event, TextEvent):
+                elapsed = time.perf_counter() - start_time
+                print(f"[{elapsed:6.2f}s] {event.text!r}")
                 answer_parts.append(event.text)
             elif isinstance(event, (ResultEvent, ErrorEvent)):
                 final_state = event.state
