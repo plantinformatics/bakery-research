@@ -962,6 +962,13 @@ class PlantBioRAG:
     #   run only after the main answer has already been yielded, so a
     #   failure here is reported inline as a TextEvent and the run still
     #   ends with a successful ResultEvent rather than an ErrorEvent.
+    #
+    # Species clarification: if it's an accession query with no species,
+    # there's no `input()` call here (no blocking on stdin under an async
+    # server). Instead the run sets `needs_clarification=True`, asks for
+    # the species as a TextEvent, and ends via ResultEvent without calling
+    # the accession API. The next user message is expected to supply the
+    # species in plain text, re-derived by `expand_question_and_queries`.
     async def query(
         self, q: str, k: int = QUERY_MAX_CHUNKS, max_context_chars: int = MAX_CHARACTERS
     ) -> AsyncGenerator[RunEvent, None]:
@@ -1038,12 +1045,15 @@ class PlantBioRAG:
             state = state.model_copy(update={"usage_metadata": usage_metadata})
 
             if is_agg_accession_query and not species:
-                species = input(
-                    "Please specify the species (e.g. wheat, barley, oat, chickpea): "
-                ).strip()
-                accession_question = f"Are these {species} accessions in AGG?"
-                logger.info("Updated accession_question: %s", accession_question)
-                state = state.model_copy(update={"species": species})
+                state = state.model_copy(update={"needs_clarification": True})
+                yield TextEvent(
+                    text="\n\nTo look up these accessions in the Australian Grains "
+                    "Genebank (AGG), please specify the species (e.g. wheat, "
+                    "barley, oat, chickpea)."
+                )
+                yield ResultEvent(state=state)
+                return
+
             if is_agg_accession_query:
                 state = state.model_copy(
                     update={"stage": Stage.CHECKING_AGG_ACCESSIONS}
