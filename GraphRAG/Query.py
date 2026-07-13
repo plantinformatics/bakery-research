@@ -948,9 +948,11 @@ class PlantBioRAG:
     # changes, text output, final result/error) as the run progresses,
     # instead of computing everything and returning once. Preserves all
     # existing retrieval/generation logic unchanged; only the control flow
-    # differs. The LLM call is not yet streamed (see Step 5) and blocking
-    # calls are not yet offloaded to a thread (see Step 7), so this still
-    # blocks the event loop internally.
+    # differs. The final-answer LLM call is streamed via `llm.astream`, and
+    # the remaining blocking calls (question/query expansion, concurrent
+    # retrieval, accession lookup/presentation - all still synchronous
+    # under the hood) are offloaded via `asyncio.to_thread(...)` so they
+    # don't block the event loop.
     #
     # Error handling policy, by stage:
     # - EXPANDING_QUESTION: recoverable. Falls back to the raw question
@@ -983,7 +985,7 @@ class PlantBioRAG:
                     is_agg_accession_query,
                     accession_question,
                     species,
-                ) = self.expand_question_and_queries(q)
+                ) = await asyncio.to_thread(self.expand_question_and_queries, q)
             except Exception as e:
                 logger.warning("Question and query expansion failed: %s", e)
                 expanded_question = q
@@ -1009,7 +1011,9 @@ class PlantBioRAG:
             # Run literature, metadata, and Pretzel context retrieval concurrently.
             start_time = time.perf_counter()
             literature_context, metadata_context, pretzel_context = (
-                self._retrieve_context(q, expanded_queries, k, max_context_chars)
+                await asyncio.to_thread(
+                    self._retrieve_context, q, expanded_queries, k, max_context_chars
+                )
             )
             end_time = time.perf_counter()
             logger.info(
@@ -1061,8 +1065,12 @@ class PlantBioRAG:
                 yield StageChangeEvent(state=state)
 
                 try:
-                    accessions, api_response = self._lookup_agg_accessions(
-                        q, answer, species, accession_question
+                    accessions, api_response = await asyncio.to_thread(
+                        self._lookup_agg_accessions,
+                        q,
+                        answer,
+                        species,
+                        accession_question,
                     )
                 except Exception as e:
                     logger.exception("AGG accession lookup failed: %s", e)
@@ -1083,8 +1091,8 @@ class PlantBioRAG:
 
                         start_time = time.perf_counter()
                         try:
-                            accession_summary = self._present_accession_results(
-                                q, api_response
+                            accession_summary = await asyncio.to_thread(
+                                self._present_accession_results, q, api_response
                             )
                         except Exception as e:
                             logger.exception(
