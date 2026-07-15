@@ -11,16 +11,37 @@ from ag_ui.core import (
     TextMessageContentEvent,
     TextMessageEndEvent,
     TextMessageStartEvent,
+    ThinkingEndEvent,
+    ThinkingStartEvent,
+    ThinkingTextMessageContentEvent,
+    ThinkingTextMessageEndEvent,
+    ThinkingTextMessageStartEvent,
 )
 from ag_ui.encoder import EventEncoder
 from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 
-from Query import ErrorEvent, PlantBioRAG, ResultEvent, StageChangeEvent, TextEvent
+from Query import (
+    ErrorEvent,
+    PlantBioRAG,
+    ReasoningEvent,
+    ResultEvent,
+    StageChangeEvent,
+    TextEvent,
+)
 
 logger = logging.getLogger(__name__)
 
 app = FastAPI()
+
+# Allow the local test UI (Vite dev server) to call this API cross-origin.
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 # Shared across requests: holds the Neo4j/Gemini clients only, no per-run state.
 rag = PlantBioRAG()
@@ -50,13 +71,35 @@ async def _run_agui_events(input: RunAgentInput) -> AsyncGenerator[str, None]:
     )
 
     message_id: Optional[str] = None
+    thinking_open = False
+
+    def _close_thinking():
+        nonlocal thinking_open
+        if not thinking_open:
+            return []
+        thinking_open = False
+        return [
+            encoder.encode(ThinkingTextMessageEndEvent()),
+            encoder.encode(ThinkingEndEvent()),
+        ]
+
     try:
         async for event in rag.query(_latest_user_message(input)):
             if isinstance(event, StageChangeEvent):
                 yield encoder.encode(
                     StateSnapshotEvent(snapshot=event.state.model_dump(mode="json"))
                 )
+            elif isinstance(event, ReasoningEvent):
+                if not thinking_open:
+                    thinking_open = True
+                    yield encoder.encode(ThinkingStartEvent())
+                    yield encoder.encode(ThinkingTextMessageStartEvent())
+                yield encoder.encode(
+                    ThinkingTextMessageContentEvent(delta=event.text)
+                )
             elif isinstance(event, TextEvent):
+                for e in _close_thinking():
+                    yield e
                 if message_id is None:
                     message_id = str(uuid.uuid4())
                     yield encoder.encode(
@@ -66,6 +109,8 @@ async def _run_agui_events(input: RunAgentInput) -> AsyncGenerator[str, None]:
                     TextMessageContentEvent(message_id=message_id, delta=event.text)
                 )
             elif isinstance(event, ResultEvent):
+                for e in _close_thinking():
+                    yield e
                 if message_id is not None:
                     yield encoder.encode(TextMessageEndEvent(message_id=message_id))
                 yield encoder.encode(
@@ -75,6 +120,8 @@ async def _run_agui_events(input: RunAgentInput) -> AsyncGenerator[str, None]:
                     RunFinishedEvent(thread_id=input.thread_id, run_id=input.run_id)
                 )
             elif isinstance(event, ErrorEvent):
+                for e in _close_thinking():
+                    yield e
                 if message_id is not None:
                     yield encoder.encode(TextMessageEndEvent(message_id=message_id))
                 yield encoder.encode(
@@ -82,6 +129,8 @@ async def _run_agui_events(input: RunAgentInput) -> AsyncGenerator[str, None]:
                 )
     except Exception as e:
         logger.exception("Unhandled error while streaming AG-UI events: %s", e)
+        for ev in _close_thinking():
+            yield ev
         if message_id is not None:
             yield encoder.encode(TextMessageEndEvent(message_id=message_id))
         yield encoder.encode(RunErrorEvent(message=str(e)))

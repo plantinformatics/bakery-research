@@ -38,6 +38,11 @@ logger = logging.getLogger(__name__)
 
 GEMINI_MODEL = "gemini-3-flash-preview"
 GEMINI_EMBEDDING_MODEL = "models/gemini-embedding-001"
+# How hard the model reasons before producing the final answer (Gemini 3+
+# models only; replaces the older token-based `thinking_budget`).
+# One of "minimal", "low", "medium", "high" - higher levels reason more
+# deeply at the cost of latency/tokens. Unset defaults to "high".
+ANSWER_THINKING_LEVEL = "medium"
 MAX_CHARACTERS = 600000
 MAX_TRIPLES = 50
 QUERY_VECTOR_MAX_CHUNKS = 40
@@ -95,6 +100,14 @@ class TextEvent:
 
 
 @dataclass
+class ReasoningEvent:
+    """A chunk of the model's thinking/reasoning trace, emitted separately
+    from the final answer text (see `include_thoughts` on `self.llm`)."""
+
+    text: str
+
+
+@dataclass
 class ResultEvent:
     state: RunState
 
@@ -104,7 +117,7 @@ class ErrorEvent:
     state: RunState
 
 
-RunEvent = Union[StageChangeEvent, TextEvent, ResultEvent, ErrorEvent]
+RunEvent = Union[StageChangeEvent, TextEvent, ReasoningEvent, ResultEvent, ErrorEvent]
 
 
 global_instruction_and_information = """
@@ -407,6 +420,21 @@ class PlantBioRAG:
     def _llm_invoke(self, prompt: Any) -> str:
         resp = self.llm.invoke(prompt)
         return self._message_text(resp).strip()
+
+    # Extracts the model's thinking/reasoning-trace text from a response or
+    # streamed chunk. Only populated when `include_thoughts=True` is passed
+    # to the call (see `_generate_answer_stream`); other LLM calls in this
+    # class don't request thoughts, so this returns "" for them.
+    @staticmethod
+    def _message_thinking(resp: Any) -> str:
+        content = getattr(resp, "content", "")
+        if not isinstance(content, list):
+            return ""
+        return "".join(
+            part.get("thinking", "")
+            for part in content
+            if isinstance(part, dict) and part.get("type") == "thinking"
+        )
 
     # Question analysis and retrieval query expansion
     def expand_question_and_queries(
@@ -908,7 +936,11 @@ class PlantBioRAG:
     # response via `llm.astream` so `query()` can yield text chunks as they
     # arrive instead of blocking for the full answer.
     async def _generate_answer_stream(self, prompt: Any) -> AsyncGenerator[Any, None]:
-        async for chunk in self.llm.astream(prompt):
+        async for chunk in self.llm.astream(
+            prompt,
+            thinking_level=ANSWER_THINKING_LEVEL,
+            include_thoughts=True,
+        ):
             yield chunk
 
     # Stages: CHECKING_AGG_ACCESSIONS. Extraction can itself fail (it calls
@@ -1037,6 +1069,9 @@ class PlantBioRAG:
             full_chunk = None
             async for chunk in self._generate_answer_stream(prompt):
                 full_chunk = chunk if full_chunk is None else full_chunk + chunk
+                thinking = self._message_thinking(chunk)
+                if thinking:
+                    yield ReasoningEvent(text=thinking)
                 text = self._message_text(chunk)
                 if text:
                     answer_parts.append(text)
