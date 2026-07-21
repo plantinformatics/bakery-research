@@ -1,0 +1,1 @@
+When trying to run things locally, use the version of python found in .venv first
