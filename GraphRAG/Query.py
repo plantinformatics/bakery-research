@@ -58,6 +58,11 @@ ACCESSION_API_TIMEOUT = 120
 
 METADATA_MAX_CHARACTERS = 300000
 
+SEMANTIC_CACHE_INDEX = "semantic_cache_vector"
+SEMANTIC_CACHE_THRESHOLD = 0.92
+SEMANTIC_CACHE_TOP_K = 1
+SEMANTIC_CACHE_TTL_DAYS = 14
+
 
 class Stage(str, Enum):
     """Ordered stages of a `PlantBioRAG.query()` run, named after the
@@ -177,6 +182,45 @@ class PlantBioRAG:
             embedding_node_property="embedding",
             index_name="vector",
         )
+        self._ensure_semantic_cache_vector_index()
+        self._clear_expired_semantic_cache()
+
+    def _ensure_semantic_cache_vector_index(self) -> None:
+        try:
+            self.graph.query(
+                """
+                CREATE VECTOR INDEX semantic_cache_vector IF NOT EXISTS
+                FOR (c:SemanticCache)
+                ON (c.embedding)
+                OPTIONS {
+                  indexConfig: {
+                    `vector.dimensions`: 3072,
+                    `vector.similarity_function`: 'cosine'
+                  }
+                }
+                """
+            )
+            logger.info("Semantic cache vector index ensured: %s", SEMANTIC_CACHE_INDEX)
+        except Exception as e:
+            logger.warning("Failed to ensure semantic cache vector index: %s", e)
+
+    def _clear_expired_semantic_cache(self) -> None:
+        try:
+            res = self.graph.query(
+                """
+                MATCH (c:SemanticCache)
+                WHERE c.created_at IS NOT NULL
+                  AND c.created_at < datetime() - duration({days: $ttl_days})
+                WITH collect(c) AS expired, count(c) AS deleted_count
+                FOREACH (n IN expired | DETACH DELETE n)
+                RETURN deleted_count
+                """,
+                params={"ttl_days": SEMANTIC_CACHE_TTL_DAYS},
+            )
+            deleted_count = res[0]["deleted_count"] if res else 0
+            logger.info("Cleared expired semantic cache entries: %s", deleted_count)
+        except Exception as e:
+            logger.warning("Failed to clear expired semantic cache entries: %s", e)
 
     # 1. Literature Graph RAG
     # 1. Vector indexing
@@ -815,6 +859,66 @@ class PlantBioRAG:
             total_chars += len(text)
         return "\n".join(context_parts)
 
+    def _semantic_cache_lookup(self, q_emb) -> Optional[tuple[str, str, dict]]:
+        res = self.graph.query(
+            """
+        CALL db.index.vector.queryNodes($index, $k, $emb)
+        YIELD node, score
+        WHERE score >= $threshold
+          AND node.created_at IS NOT NULL
+          AND node.created_at >= datetime() - duration({days: $ttl_days})
+        RETURN node.question AS question,
+               node.expanded_question AS expanded_question,
+               node.answer AS answer,
+               node.usage_metadata AS usage_metadata,
+               score
+        ORDER BY score DESC
+        LIMIT 1
+        """,
+            params={
+                "index": SEMANTIC_CACHE_INDEX,
+                "k": SEMANTIC_CACHE_TOP_K,
+                "emb": q_emb,
+                "threshold": SEMANTIC_CACHE_THRESHOLD,
+                "ttl_days": SEMANTIC_CACHE_TTL_DAYS,
+            },
+        )
+        if not res:
+            return None
+        r = res[0]
+        logger.info(
+            "Semantic cache hit: score=%s question=%s", r["score"], r["question"]
+        )
+        usage = {}
+        try:
+            usage = json.loads(r.get("usage_metadata") or "{}")
+        except Exception:
+            pass
+        return r["expanded_question"], r["answer"], usage
+
+    def _semantic_cache_store(
+        self, q: str, expanded_question: str, answer: str, usage_metadata: dict, q_emb
+    ) -> None:
+        self.graph.query(
+            """
+        CREATE (c:SemanticCache {
+            question: $question,
+            expanded_question: $expanded_question,
+            answer: $answer,
+            usage_metadata: $usage_metadata,
+            embedding: $embedding,
+            created_at: datetime()
+        })
+        """,
+            params={
+                "question": q,
+                "expanded_question": expanded_question,
+                "answer": answer,
+                "usage_metadata": json.dumps(usage_metadata),
+                "embedding": q_emb,
+            },
+        )
+
     # --- Step helpers for query() -------------------------------------
     # Each helper below does the "real work" for one stage of the pipeline
     # and either returns plain data or raises. `query()` itself stays
@@ -930,6 +1034,52 @@ class PlantBioRAG:
             Answer:"""
         return prompt
 
+    # Prompt used on a semantic-cache hit: instead of re-running retrieval,
+    # ask the LLM to answer the new question using only the cached answer
+    # to a very similar prior question as context.
+    def _build_cached_answer_prompt(self, q: str, cached_answer: str) -> str:
+        return (
+            global_instruction_and_information
+            + f"""
+            You are a plant biology RAG expert. 
+        read the provided context. 
+        read user question in @@@@. 
+
+        if a piece of provided context is contradictory or irrelevant to the user question, ignore it. 
+        if a piece of provided context directly supports answer to user question, keep it. 
+
+        concisely and directly answer user question in @@@@ based ONLY on the previous answer with a very similar question in ####. 
+
+        Keep citation of sources after facts by appending [Source: ]. 
+        Do not include [Source: Previous Answer] in response.  
+        Do not make up content in answer. 
+
+        Do not infer beyond the retrieved context. 
+        Prefer concise and direct answers. 
+        
+        If useful, structure answer as:
+        1. Answer
+        2. Evidence
+        3. Limitations / missing information
+
+        Never assume genomic coordinates, chromosome assignments, or marker locations are transferable between assemblies. 
+        Before reporting that a marker is located in the requested assembly, verify that the marker is explicitly annotated in that exact assembly in the retrieved context. 
+        Chromosome-level evidence from literature, trait associations, or another assembly does not prove the marker has a position in the requested assembly. 
+        If the marker is annotated only in another assembly, label that assembly as the source assembly and say the requested assembly coordinate is not available in the retrieved context. 
+
+            User Question:
+            @@@@
+            {q}
+            @@@@
+
+            Previous answer to a similar question: 
+            ####
+            {cached_answer}
+            ####
+
+            Answer:"""
+        )
+
     # Stage: GENERATING_ANSWER. Fatal by design: with no answer, there is
     # nothing useful left to yield, so `query()` lets this propagate up to
     # its outer `except` and end the run with an `ErrorEvent`. Streams the
@@ -1010,6 +1160,47 @@ class PlantBioRAG:
         state = RunState(stage=Stage.EXPANDING_QUESTION)
         try:
             start_time = time.perf_counter()
+            q_emb = await asyncio.to_thread(self.emb.embed_query, q)
+            cached = await asyncio.to_thread(self._semantic_cache_lookup, q_emb)
+            end_time = time.perf_counter()
+            logger.info(f"0. Semantic cache lookup: {end_time - start_time:0.1f} sec.")
+
+            if cached:
+                cached_expanded_question, cached_answer, _cached_usage = cached
+                state = state.model_copy(
+                    update={
+                        "stage": Stage.GENERATING_ANSWER,
+                        "expanded_question": cached_expanded_question,
+                    }
+                )
+                yield StageChangeEvent(state=state)
+
+                prompt = self._build_cached_answer_prompt(q, cached_answer)
+
+                start_time = time.perf_counter()
+                answer_parts = []
+                full_chunk = None
+                async for chunk in self._generate_answer_stream(prompt):
+                    full_chunk = chunk if full_chunk is None else full_chunk + chunk
+                    thinking = self._message_thinking(chunk)
+                    if thinking:
+                        yield ReasoningEvent(text=thinking)
+                    text = self._message_text(chunk)
+                    if text:
+                        answer_parts.append(text)
+                        yield TextEvent(text=text)
+                end_time = time.perf_counter()
+                logger.info(
+                    "4. Use LLM and previous cached answer to answer: %.1f sec.",
+                    end_time - start_time,
+                )
+
+                usage_metadata = getattr(full_chunk, "usage_metadata", {}) or {}
+                state = state.model_copy(update={"usage_metadata": usage_metadata})
+                yield ResultEvent(state=state)
+                return
+
+            start_time = time.perf_counter()
             try:
                 (
                     expanded_question,
@@ -1082,6 +1273,7 @@ class PlantBioRAG:
             answer = "".join(answer_parts).strip()
             usage_metadata = getattr(full_chunk, "usage_metadata", {}) or {}
             state = state.model_copy(update={"usage_metadata": usage_metadata})
+            full_answer = answer
 
             if is_agg_accession_query and not species:
                 state = state.model_copy(update={"needs_clarification": True})
@@ -1089,6 +1281,15 @@ class PlantBioRAG:
                     text="\n\nTo look up these accessions in the Australian Grains "
                     "Genebank (AGG), please specify the species (e.g. wheat, "
                     "barley, oat, chickpea)."
+                )
+                # Leaving this in for the moment until we add something filter out unrelated queries
+                await asyncio.to_thread(
+                    self._semantic_cache_store,
+                    q,
+                    expanded_question,
+                    full_answer,
+                    usage_metadata,
+                    q_emb,
                 )
                 yield ResultEvent(state=state)
                 return
@@ -1138,19 +1339,25 @@ class PlantBioRAG:
                         logger.info(
                             f"8. Summarise and present accession results: {end_time - start_time:0.1f} sec."
                         )
-                        yield TextEvent(
-                            text="\n\n---\n\n**Australian Grains Genebank (AGG) Accession Lookup:**\n"
+                        appended_text = (
+                            "\n\n---\n\n**Australian Grains Genebank (AGG) Accession Lookup:**\n"
                             + accession_summary
                         )
                     else:
-                        yield TextEvent(
-                            text="\n\n[AGG accession lookup failed — API unavailable or returned no data.]"
-                        )
+                        appended_text = "\n\n[AGG accession lookup failed — API unavailable or returned no data.]"
                 else:
-                    yield TextEvent(
-                        text="\n\n[No accession names could be extracted from the RAG answer to query the AGG API.]"
-                    )
+                    appended_text = "\n\n[No accession names could be extracted from the RAG answer to query the AGG API.]"
+                full_answer += appended_text
+                yield TextEvent(text=appended_text)
 
+            await asyncio.to_thread(
+                self._semantic_cache_store,
+                q,
+                expanded_question,
+                full_answer,
+                usage_metadata,
+                q_emb,
+            )
             yield ResultEvent(state=state)
         except Exception as e:
             logger.exception("query() failed: %s", e)
