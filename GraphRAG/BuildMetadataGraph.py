@@ -5,9 +5,9 @@ from langchain_google_genai import GoogleGenerativeAIEmbeddings
 
 os.environ["GOOGLE_API_KEY"] = ""
 
-NEO4J_URI = ""
-NEO4J_USER = ""
-NEO4J_PASS = ""
+os.environ["NEO4J_URI"] = ""
+os.environ["NEO4J_USERNAME"] = ""
+os.environ["NEO4J_PASSWORD"] = ""
 
 GEMINI_EMBEDDING_MODEL = "models/gemini-embedding-001"
 GEMINI_EMBEDDING_DIMS = 3072
