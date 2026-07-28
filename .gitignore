@@ -3,4 +3,4 @@
 __pycache__/
 *.pyc
 .test_runs
-frontend
+frontend-dummy
