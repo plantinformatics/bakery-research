@@ -15,6 +15,7 @@ import logging
 from pathlib import Path
 from langchain_core.callbacks import UsageMetadataCallbackHandler
 from langchain_core.prompts import ChatPromptTemplate
+import yaml
 
 os.environ["GOOGLE_API_KEY"] = ""
 os.environ["NEO4J_URI"] = ""
@@ -30,29 +31,52 @@ QUERY_VECTOR_MAX_CHUNKS = 1
 QUERY_FULL_TEXT_MAX_CHUNKS = 1
 QUERY_MAX_CHUNKS = 16
 
+# def parse_schema_for_llm(schema_path: str) -> Tuple[List[str], List[Tuple[str, str, str]]]:
+#         # Parse SHACL Turtle to extract allowed Nodes and Relationships. 
+#         g = rdflib.Graph()
+#         g.parse(schema_path, format="turtle")        
+#         SH = Namespace("http://www.w3.org/ns/shacl#")        
+#         allowed_nodes = set()
+#         allowed_rels_tuples = [] # (Source, Rel, Target)
+#         for shape in g.subjects(RDF.type, SH.NodeShape):
+#             target_class = g.value(shape, SH.targetClass)
+#             if not target_class:
+#                 continue            
+#             source_node = target_class.split('#')[-1]
+#             allowed_nodes.add(source_node)
+#             for prop in g.objects(shape, SH.property):
+#                 path = g.value(prop, SH.path)
+#                 class_constraint = g.value(prop, SH["class"])                
+#                 # If sh:class exists, it's a relationship to another node. 
+#                 if path and class_constraint:
+#                     rel_name = path.split('#')[-1].upper().replace("-", "_")
+#                     target_node = class_constraint.split('#')[-1]
+#                     allowed_nodes.add(target_node)
+#                     allowed_rels_tuples.append((source_node, rel_name, target_node))
+#         return list(allowed_nodes), allowed_rels_tuples
+
 def parse_schema_for_llm(schema_path: str) -> Tuple[List[str], List[Tuple[str, str, str]]]:
-        # Parse SHACL Turtle to extract allowed Nodes and Relationships. 
-        g = rdflib.Graph()
-        g.parse(schema_path, format="turtle")        
-        SH = Namespace("http://www.w3.org/ns/shacl#")        
-        allowed_nodes = set()
-        allowed_rels_tuples = [] # (Source, Rel, Target)
-        for shape in g.subjects(RDF.type, SH.NodeShape):
-            target_class = g.value(shape, SH.targetClass)
-            if not target_class:
-                continue            
-            source_node = target_class.split('#')[-1]
-            allowed_nodes.add(source_node)
-            for prop in g.objects(shape, SH.property):
-                path = g.value(prop, SH.path)
-                class_constraint = g.value(prop, SH["class"])                
-                # If sh:class exists, it's a relationship to another node. 
-                if path and class_constraint:
-                    rel_name = path.split('#')[-1].upper().replace("-", "_")
-                    target_node = class_constraint.split('#')[-1]
-                    allowed_nodes.add(target_node)
-                    allowed_rels_tuples.append((source_node, rel_name, target_node))
-        return list(allowed_nodes), allowed_rels_tuples
+    with open(schema_path, encoding="utf-8") as f:
+        schema = yaml.safe_load(f) or {}
+    allowed_nodes = list(schema.get("entities", {}))
+    allowed_relationships = []
+    for relationship_name, spec in schema.get("relationships", {}).items():
+        source_nodes = (
+            spec["from"]
+            if isinstance(spec["from"], list)
+            else [spec["from"]]
+        )
+        target_nodes = (
+            spec["to"]
+            if isinstance(spec["to"], list)
+            else [spec["to"]]
+        )
+        for source_node in source_nodes:
+            for target_node in target_nodes:
+                allowed_relationships.append(
+                    (source_node, relationship_name, target_node)
+                )
+    return allowed_nodes, allowed_relationships
 
 
 class PlantBioRAG:
@@ -363,12 +387,12 @@ class PlantBioRAG:
 
 
 def main():
-    mode = "build"
+    mode = "add"
     md_dir = r""
     add_dir = r""
     pretzel_functions_dir = r""
-    extract_nodes = False
-    schema = r"shapes.ttl"
+    extract_nodes = True
+    schema = r"grand_schema_v2.2.yaml"
 
     rag = PlantBioRAG(md_dir, add_dir, pretzel_functions_dir, schema)
     
