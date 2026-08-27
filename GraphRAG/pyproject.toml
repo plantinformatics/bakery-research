@@ -1,0 +1,32 @@
+[project]
+name = "graphrag"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+authors = [
+    { name = "kennyAgricultureVic", email = "kenny.yu@agriculture.vic.gov.au" }
+]
+requires-python = ">=3.14"
+dependencies = [
+    "ag-ui-protocol>=0.1.20",
+    "fastapi>=0.141.1",
+    "langchain-community>=0.4.2",
+    "langchain-core>=1.6.0",
+    "langchain-experimental>=0.4.2",
+    "langchain-google-genai>=4.3.5",
+    "langchain-neo4j>=0.10.0",
+    "langchain-text-splitters>=1.1.2",
+    "neo4j>=6.2.0",
+    "numpy>=2.5.2",
+    "pydantic>=2.13.4",
+    "rdflib>=7.6.0",
+    "requests>=2.34.2",
+    "uvicorn>=0.52.4",
+]
+
+[project.scripts]
+graphrag = "graphrag:main"
+
+[build-system]
+requires = ["uv_build>=0.12.5,<0.13.0"]
+build-backend = "uv_build"
