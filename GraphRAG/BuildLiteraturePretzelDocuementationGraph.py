@@ -1,6 +1,8 @@
-import os, glob, uuid, json, argparse
-from typing import List, Tuple, Dict
+from langchain_core.documents.base import Document
+import os, glob, hashlib, json, argparse
+from typing import List, Literal, Tuple
 import rdflib
+import asyncio
 from rdflib.namespace import RDF
 from rdflib import RDF, Namespace
 from langchain_core.documents import Document
@@ -9,8 +11,7 @@ from langchain_text_splitters import (
     RecursiveCharacterTextSplitter,
 )
 from langchain_google_genai import ChatGoogleGenerativeAI, GoogleGenerativeAIEmbeddings
-from langchain_experimental.graph_transformers import LLMGraphTransformer
-from langchain_neo4j import Neo4jGraph, Neo4jVector
+from langchain_neo4j import LLMGraphTransformer, Neo4jGraph, Neo4jVector
 import csv
 import time
 import logging
@@ -20,16 +21,43 @@ from langchain_core.prompts import ChatPromptTemplate
 import yaml
 from dotenv import load_dotenv
 
+# Enviroment imports (keys ect)
 load_dotenv(Path(__file__).resolve().parents[1] / ".env")
 
+# Model Specific config
 GEMINI_MODEL = "gemini-3-flash-preview"
 GEMINI_EXTRACTION_MODEL = "gemini-2.5-flash"
 GEMINI_EMBEDDING_MODEL = "models/gemini-embedding-001"
+
+# Chunking config
+CHUNK_SIZE = 1200
+CHUNK_OVERLAP = 200
+
+# Relationship config
 MAX_CHARACTERS = 30000
 MAX_TRIPLES = 50
 QUERY_VECTOR_MAX_CHUNKS = 1
 QUERY_FULL_TEXT_MAX_CHUNKS = 1
 QUERY_MAX_CHUNKS = 16
+
+# Retry strategy (for LLM calls)
+RetryStrategy = Literal["exponential", "linear"]
+GLOBAL_MAX_RETRIES = 5
+
+
+def get_retry_wait_s(attempts: int, strategy: RetryStrategy = "exponential") -> float:
+    if strategy not in ("exponential", "linear"):
+        raise ValueError(f"Unknown retry strategy: {strategy}")
+
+    wait_min = 2 ** (attempts - 1) if strategy == "exponential" else 5 * attempts
+    if strategy == "exponential" and attempts > 5:
+        logging.warning(
+            "Exponential retry attempt %s exceeds 5; next wait is %.0f minutes ",
+            attempts,
+            wait_min,
+        )
+    return wait_min * 60.0
+
 
 # def parse_schema_for_llm(schema_path: str) -> Tuple[List[str], List[Tuple[str, str, str]]]:
 #         # Parse SHACL Turtle to extract allowed Nodes and Relationships.
@@ -114,7 +142,7 @@ class PlantBioRAG:
         headers = [("#", "Header 1"), ("##", "Header 2"), ("###", "Header 3")]
         self.md_splitter = MarkdownHeaderTextSplitter(headers_to_split_on=headers)
         self.text_splitter = RecursiveCharacterTextSplitter(
-            chunk_size=1200, chunk_overlap=200
+            chunk_size=CHUNK_SIZE, chunk_overlap=CHUNK_OVERLAP
         )
         self.failed_docs_file = Path(r"failed_docs.jsonl")
 
@@ -130,15 +158,17 @@ class PlantBioRAG:
             # Split to chunks
             chunks = self.text_splitter.split_documents(md_docs)
             # Add metadata for file tracking
-            for i, chunk in enumerate(chunks):
-                chunk.metadata["source_path"] = os.path.basename(path)
-                chunk.metadata["chunk_id"] = str(uuid.uuid4())
+            for i, chunk in enumerate[Document](chunks):
+                source_path = os.path.basename(path)
+                # Added fixed chunking IDs so they don't change between runs
+                chunk_id = hashlib.sha256(
+                    f"{source_path}::{i}::{chunk.page_content}".encode("utf-8")
+                ).hexdigest()
+                chunk.metadata["source_path"] = source_path
+                chunk.metadata["chunk_id"] = chunk_id
+                chunk.id = chunk_id
             all_chunks.extend(chunks)
         return all_chunks
-
-    def get_retry_wait_s(attempt: int) -> float:
-        retry_waits = [60, 120, 300, 600, 1200]
-        return retry_waits[min(attempt, len(retry_waits) - 1)]
 
     # 2. Upsert chunks and vectors to a Neo4j graph.
     def upsert_chunks_and_vectors(self, docs: List[Document]):
@@ -148,20 +178,7 @@ class PlantBioRAG:
             "CREATE CONSTRAINT chunk_id_unique IF NOT EXISTS FOR (c:Chunk) REQUIRE c.chunk_id IS UNIQUE"
         )
 
-        retry_waits = [
-            60,
-            2 * 60,
-            3 * 60,
-            5 * 60,
-            10 * 60,
-            20 * 60,
-            30 * 60,
-            45 * 60,
-            60 * 60,
-            120 * 60,
-            240 * 60,
-        ]
-        max_retries = len(retry_waits)
+        max_retries = GLOBAL_MAX_RETRIES
         batch_size = 20
         logging.info(f"len(docs): {len(docs)}")
         for i in range(0, len(docs), batch_size):
@@ -174,7 +191,7 @@ class PlantBioRAG:
                     break
                 except Exception as e:
                     if attempt < max_retries - 1:
-                        wait_s = retry_waits[attempt]
+                        wait_s = get_retry_wait_s(attempt + 1)
                         logging.warning(
                             f"Retry {attempt + 1}/{max_retries} after {wait_s:.1f}s due to: {e}"
                         )
@@ -205,13 +222,13 @@ class PlantBioRAG:
             f"CREATE FULLTEXT INDEX idx_node_name IF NOT EXISTS FOR (n:{labels}) ON EACH [n.name]"
         )
 
-    def _save_failed_docs(self, docs: List[Document]):
+    def _save_failed_chunks(self, chunks: List[Document]):
         self.failed_docs_file.parent.mkdir(parents=True, exist_ok=True)
         with open(self.failed_docs_file, "a", encoding="utf-8") as f:
             json.dump(
                 [
-                    {"page_content": d.page_content, "metadata": d.metadata}
-                    for d in docs
+                    {"page_content": c.page_content, "metadata": c.metadata}
+                    for c in chunks
                 ],
                 f,
                 ensure_ascii=False,
@@ -219,47 +236,34 @@ class PlantBioRAG:
             )
             f.write("\n")
 
-    def _chunk_has_content(self, doc: Document) -> bool:
-        if len(doc.page_content) < 200:
-            return False
-        return True
-
     # 4. Extract nodes and relationships from document text.
-    def extract_graph_and_link_mentions(self, docs: List[Document]):
+    def extract_graph_and_link_mentions(self, chunks: List[Document]):
+        original_count = len(chunks)
+        # Filtering for chunks with no content because of overlap
+        chunks = [c for c in chunks if len(c.page_content) >= CHUNK_OVERLAP]
+        if not chunks:
+            logging.info("No chunk to process.")
+            return
+        if len(chunks) < original_count:
+            logging.info(
+                f"Filtered out {original_count - len(chunks)} short chunk(s); "
+                f"{len(chunks)} remaining."
+            )
         xformer = LLMGraphTransformer(
             llm=self.extraction_llm,
-            allowed_nodes=self.allowed_nodes or None,
             allowed_relationships=self.allowed_rels,
         )
 
-        docs = [d for d in docs if self._chunk_has_content(d)]
-        if not docs:
-            logging.info("No chunk to process.")
-            return
-
-        retry_waits = [
-            60,
-            2 * 60,
-            3 * 60,
-            5 * 60,
-            10 * 60,
-            20 * 60,
-            30 * 60,
-            45 * 60,
-            60 * 60,
-            120 * 60,
-            240 * 60,
-        ]
-        max_retries = len(retry_waits)
+        max_retries = GLOBAL_MAX_RETRIES
         batch_size = 4
-        logging.info(f"len(docs): {len(docs)}")
+        logging.info(f"len(chunks): {len(chunks)}")
 
         input_tokens_sum = 0
         output_tokens_sum = 0
         total_tokens_sum = 0
-        for i in range(0, len(docs), batch_size):
+        for i in range(0, len(chunks), batch_size):
             logging.info(f"index i: {i}")
-            batch = docs[i : i + batch_size]
+            batch = chunks[i : i + batch_size]
             for attempt in range(max_retries):
                 try:
                     logging.info(
@@ -267,8 +271,10 @@ class PlantBioRAG:
                     )
 
                     handler = UsageMetadataCallbackHandler()
-                    gdocs = xformer.convert_to_graph_documents(
-                        batch, config={"callbacks": [handler]}
+                    gdocs = asyncio.run(
+                        xformer.aconvert_to_graph_documents(
+                            batch, config={"callbacks": [handler]}
+                        )
                     )
 
                     logging.info(f"Batch {i} token usage: {handler.usage_metadata}")
@@ -325,7 +331,7 @@ class PlantBioRAG:
                     break
                 except Exception as e:
                     if attempt < max_retries - 1:
-                        wait_s = retry_waits[attempt]
+                        wait_s = get_retry_wait_s(attempt + 1)
                         logging.warning(
                             f"Retry {attempt + 1}/{max_retries} for batch {i} to {i + len(batch) - 1} "
                             f"after {wait_s:.1f}s due to: {e}"
@@ -335,7 +341,7 @@ class PlantBioRAG:
                         logging.exception(
                             f"Failed batch {i} to {i + len(batch) - 1} after {max_retries} attempts: {e}"
                         )
-                        self._save_failed_docs(batch)
+                        self._save_failed_chunks(batch)
 
         logging.info(f"Input tokens sum: {input_tokens_sum}")
         logging.info(f"Output tokens sum: {output_tokens_sum}")
@@ -380,7 +386,7 @@ class PlantBioRAG:
             MERGE (c:Chunk {chunk_id: row.chunk_id})
             SET c.source_path = row.source_path,
                 c.text = row.text
-        """,
+            """,
             params={"rows": rows},
         )
 
@@ -433,20 +439,7 @@ class PlantBioRAG:
             FOR (p:PretzelFunction) ON EACH [p.text]"""
         )
 
-        retry_waits = [
-            60,
-            2 * 60,
-            3 * 60,
-            5 * 60,
-            10 * 60,
-            20 * 60,
-            30 * 60,
-            45 * 60,
-            60 * 60,
-            120 * 60,
-            240 * 60,
-        ]
-        max_retries = len(retry_waits)
+        max_retries = GLOBAL_MAX_RETRIES
         batch_size = 4
         logging.info(f"len(docs): {len(docs)}")
         for i in range(0, len(docs), batch_size):
@@ -459,7 +452,7 @@ class PlantBioRAG:
                     break
                 except Exception as e:
                     if attempt < max_retries - 1:
-                        wait_s = retry_waits[attempt]
+                        wait_s = get_retry_wait_s(attempt + 1)
                         logging.warning(
                             f"Retry {attempt + 1}/{max_retries} after {wait_s:.1f}s due to: {e}"
                         )
