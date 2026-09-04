@@ -379,6 +379,12 @@ const AssistantMessage: FC = () => {
     ToolGroup,
     ReasoningGroup,
   } = useContext(ThreadComponentsContext);
+  // Keep the reasoning panel open for the whole assistant turn. A reasoning
+  // part is only `running` while it is the last part, so it would otherwise
+  // collapse the moment answer text starts streaming.
+  const isGenerating = useAuiState(
+    (s) => s.message.status?.type === "running",
+  );
 
   const ACTION_BAR_PT = "pt-1.5";
   // Keep the action bar inside the contained root's paint box, then cancel its reserved space in flow.
@@ -424,11 +430,11 @@ const AssistantMessage: FC = () => {
                     <ReasoningGroup group={part}>{children}</ReasoningGroup>
                   );
                 }
-                const running = part.status.type === "running";
+                const reasoningStreaming = part.status.type === "running";
                 return (
-                  <ReasoningRoot streaming={running}>
-                    <ReasoningTrigger active={running} />
-                    <ReasoningContent aria-busy={running}>
+                  <ReasoningRoot streaming={isGenerating} defaultOpen>
+                    <ReasoningTrigger active={reasoningStreaming} />
+                    <ReasoningContent aria-busy={isGenerating}>
                       <ReasoningText>{children}</ReasoningText>
                     </ReasoningContent>
                   </ReasoningRoot>

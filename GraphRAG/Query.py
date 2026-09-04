@@ -175,6 +175,15 @@ class PlantBioRAG:
     def __init__(self):
         self.emb = GoogleGenerativeAIEmbeddings(model=GEMINI_EMBEDDING_MODEL)
         self.llm = ChatGoogleGenerativeAI(model=GEMINI_MODEL, temperature=0)
+        # Separate client so only the final-answer call requests thought text.
+        # Other `_llm_invoke` calls (JSON extraction, accession presentation)
+        # would otherwise pay for unused thinking tokens.
+        self.answer_llm = ChatGoogleGenerativeAI(
+            model=GEMINI_MODEL,
+            temperature=0,
+            include_thoughts=True,
+            thinking_level=ANSWER_THINKING_LEVEL,
+        )
         self.graph = Neo4jGraph()
         self.vs = Neo4jVector(
             embedding=self.emb,
@@ -458,11 +467,15 @@ class PlantBioRAG:
         if isinstance(content, str):
             return content
         if isinstance(content, list):
-            return "".join(
-                part.get("text", "") if isinstance(part, dict) else str(part)
-                for part in content
-                if part
-            )
+            pieces: List[str] = []
+            for part in content:
+                if isinstance(part, str):
+                    pieces.append(part)
+                elif isinstance(part, dict) and part.get("type") in (None, "text"):
+                    text_part = part.get("text") or ""
+                    if text_part:
+                        pieces.append(text_part)
+            return "".join(pieces)
         return str(content) if content else str(resp)
 
     def _llm_invoke(self, prompt: Any) -> str:
@@ -473,15 +486,36 @@ class PlantBioRAG:
     # streamed chunk. Only populated when `include_thoughts=True` is passed
     # to the call (see `_generate_answer_stream`); other LLM calls in this
     # class don't request thoughts, so this returns "" for them.
+    #
+    # LangChain's Google GenAI adapter stores thoughts as v0
+    # `{type: "thinking", thinking: ...}` blocks on `.content`, and as v1
+    # `{type: "reasoning", reasoning: ...}` blocks on `.content_blocks`.
+    @staticmethod
+    def _thinking_from_parts(parts: Any) -> str:
+        if not isinstance(parts, list):
+            return ""
+        pieces: List[str] = []
+        for part in parts:
+            if not isinstance(part, dict):
+                continue
+            kind = part.get("type")
+            if kind == "thinking":
+                text = part.get("thinking") or part.get("text") or ""
+            elif kind == "reasoning":
+                text = part.get("reasoning") or part.get("text") or ""
+            else:
+                continue
+            if isinstance(text, str) and text:
+                pieces.append(text)
+        return "".join(pieces)
+
     @staticmethod
     def _message_thinking(resp: Any) -> str:
-        content = getattr(resp, "content", "")
-        if not isinstance(content, list):
-            return ""
-        return "".join(
-            part.get("thinking", "")
-            for part in content
-            if isinstance(part, dict) and part.get("type") == "thinking"
+        thinking = PlantBioRAG._thinking_from_parts(getattr(resp, "content", None))
+        if thinking:
+            return thinking
+        return PlantBioRAG._thinking_from_parts(
+            getattr(resp, "content_blocks", None)
         )
 
     # Question analysis and retrieval query expansion
@@ -1090,7 +1124,7 @@ class PlantBioRAG:
     # response via `llm.astream` so `query()` can yield text chunks as they
     # arrive instead of blocking for the full answer.
     async def _generate_answer_stream(self, prompt: Any) -> AsyncGenerator[Any, None]:
-        async for chunk in self.llm.astream(
+        async for chunk in self.answer_llm.astream(
             prompt,
             thinking_level=ANSWER_THINKING_LEVEL,
             include_thoughts=True,
