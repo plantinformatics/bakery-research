@@ -35,7 +35,7 @@ logger = logging.getLogger(__name__)
 
 app = FastAPI()
 
-# Allow the local test UI (Vite dev server) to call this API cross-origin.
+# Allow the local Next.js UI (`frontend/`, typically :3000) to call this API.
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],

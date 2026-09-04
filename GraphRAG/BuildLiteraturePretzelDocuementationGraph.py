@@ -376,7 +376,7 @@ class PlantBioRAG:
 
             docs = self.load_and_split(self.md_dir)
             if not docs:
-                logging.warning("No documents to process at", self.md_dir)
+                logging.warning("No documents to process at %s", self.md_dir)
                 return
             logging.info("Completed load_and_split")
 
@@ -418,7 +418,7 @@ class PlantBioRAG:
 
             docs = self.load_and_split(self.add_dir)
             if not docs:
-                logging.warning("No documents to process at", self.add_dir)
+                logging.warning("No documents to process at %s", self.add_dir)
                 return
             logging.info("Completed load_and_split")
 
@@ -491,8 +491,8 @@ class PlantBioRAG:
 
             self.upsert_pretzel_functions_and_vectors(docs)
             logging.info("Completed upsert_chunks_and_vectors")
-        except Exception as e:
-            logging.exception(e)
+        except Exception:
+            logging.exception("Add pretzel functions failed.")
 
 
 def main():

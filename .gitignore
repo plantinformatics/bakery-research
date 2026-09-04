@@ -3,6 +3,8 @@
 __pycache__/
 *.pyc
 .test_runs
-frontend
-/Part1
+
+/Docs
 *.log
+schema.yaml
+PaperExtraction.py

@@ -5,6 +5,7 @@ import os
 import argparse
 import asyncio
 from dataclasses import dataclass
+from pathlib import Path
 from typing import AsyncGenerator, List, Dict, Optional, Tuple, Any, Union
 from langchain_google_genai import ChatGoogleGenerativeAI, GoogleGenerativeAIEmbeddings
 from langchain_neo4j import Neo4jGraph, Neo4jVector
@@ -18,6 +19,9 @@ from enum import Enum
 from pydantic import BaseModel, Field
 import numpy as np
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from dotenv import load_dotenv
+
+load_dotenv(Path(__file__).resolve().parents[1] / ".env")
 
 warnings.simplefilter("ignore", DeprecationWarning)
 

@@ -94,7 +94,7 @@ Exposes the RAG pipeline as a streaming [AG-UI](https://github.com/ag-ui-protoco
 uv run uvicorn main:app --reload --port 8000
 ```
 
-This starts `POST /agent`, which accepts an AG-UI `RunAgentInput` payload and streams back Server-Sent Events (thinking, text, state snapshots, errors).
+This starts `POST /agent`, which accepts an AG-UI `RunAgentInput` payload and streams back Server-Sent Events (thinking, text, state snapshots, errors). Point the Next.js UI in `frontend/` at this URL (`NEXT_PUBLIC_AGUI_AGENT_URL=http://localhost:8000/agent`; see `frontend/README.md`).
 
 ## Data directories
 
