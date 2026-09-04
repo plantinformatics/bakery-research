@@ -3,6 +3,11 @@ import uuid
 from typing import AsyncGenerator, Optional
 
 from ag_ui.core import (
+    ReasoningEndEvent,
+    ReasoningMessageContentEvent,
+    ReasoningMessageEndEvent,
+    ReasoningMessageStartEvent,
+    ReasoningStartEvent,
     RunAgentInput,
     RunErrorEvent,
     RunFinishedEvent,
@@ -11,11 +16,6 @@ from ag_ui.core import (
     TextMessageContentEvent,
     TextMessageEndEvent,
     TextMessageStartEvent,
-    ThinkingEndEvent,
-    ThinkingStartEvent,
-    ThinkingTextMessageContentEvent,
-    ThinkingTextMessageEndEvent,
-    ThinkingTextMessageStartEvent,
 )
 from ag_ui.encoder import EventEncoder
 from fastapi import FastAPI
@@ -71,17 +71,18 @@ async def _run_agui_events(input: RunAgentInput) -> AsyncGenerator[str, None]:
     )
 
     message_id: Optional[str] = None
-    thinking_open = False
+    reasoning_message_id: Optional[str] = None
 
-    def _close_thinking():
-        nonlocal thinking_open
-        if not thinking_open:
+    def _close_reasoning():
+        nonlocal reasoning_message_id
+        if reasoning_message_id is None:
             return []
-        thinking_open = False
-        return [
-            encoder.encode(ThinkingTextMessageEndEvent()),
-            encoder.encode(ThinkingEndEvent()),
+        events = [
+            encoder.encode(ReasoningMessageEndEvent(message_id=reasoning_message_id)),
+            encoder.encode(ReasoningEndEvent(message_id=reasoning_message_id)),
         ]
+        reasoning_message_id = None
+        return events
 
     try:
         async for event in rag.query(_latest_user_message(input)):
@@ -90,15 +91,23 @@ async def _run_agui_events(input: RunAgentInput) -> AsyncGenerator[str, None]:
                     StateSnapshotEvent(snapshot=event.state.model_dump(mode="json"))
                 )
             elif isinstance(event, ReasoningEvent):
-                if not thinking_open:
-                    thinking_open = True
-                    yield encoder.encode(ThinkingStartEvent())
-                    yield encoder.encode(ThinkingTextMessageStartEvent())
+                if reasoning_message_id is None:
+                    reasoning_message_id = str(uuid.uuid4())
+                    yield encoder.encode(
+                        ReasoningStartEvent(message_id=reasoning_message_id)
+                    )
+                    yield encoder.encode(
+                        ReasoningMessageStartEvent(
+                            message_id=reasoning_message_id, role="reasoning"
+                        )
+                    )
                 yield encoder.encode(
-                    ThinkingTextMessageContentEvent(delta=event.text)
+                    ReasoningMessageContentEvent(
+                        message_id=reasoning_message_id, delta=event.text
+                    )
                 )
             elif isinstance(event, TextEvent):
-                for e in _close_thinking():
+                for e in _close_reasoning():
                     yield e
                 if message_id is None:
                     message_id = str(uuid.uuid4())
@@ -109,7 +118,7 @@ async def _run_agui_events(input: RunAgentInput) -> AsyncGenerator[str, None]:
                     TextMessageContentEvent(message_id=message_id, delta=event.text)
                 )
             elif isinstance(event, ResultEvent):
-                for e in _close_thinking():
+                for e in _close_reasoning():
                     yield e
                 if message_id is not None:
                     yield encoder.encode(TextMessageEndEvent(message_id=message_id))
@@ -120,7 +129,7 @@ async def _run_agui_events(input: RunAgentInput) -> AsyncGenerator[str, None]:
                     RunFinishedEvent(thread_id=input.thread_id, run_id=input.run_id)
                 )
             elif isinstance(event, ErrorEvent):
-                for e in _close_thinking():
+                for e in _close_reasoning():
                     yield e
                 if message_id is not None:
                     yield encoder.encode(TextMessageEndEvent(message_id=message_id))
@@ -129,7 +138,7 @@ async def _run_agui_events(input: RunAgentInput) -> AsyncGenerator[str, None]:
                 )
     except Exception as e:
         logger.exception("Unhandled error while streaming AG-UI events: %s", e)
-        for ev in _close_thinking():
+        for ev in _close_reasoning():
             yield ev
         if message_id is not None:
             yield encoder.encode(TextMessageEndEvent(message_id=message_id))

@@ -5,10 +5,7 @@ import {
   AssistantRuntimeProvider,
   type ThreadMessage,
 } from "@assistant-ui/react";
-import {
-  BackwardCompatibility_0_0_45,
-  HttpAgent,
-} from "@ag-ui/client";
+import { HttpAgent } from "@ag-ui/client";
 import { useAgUiRuntime } from "@assistant-ui/react-ag-ui";
 import { AGUI_AGENT_URL } from "@/lib/agent";
 
@@ -31,16 +28,15 @@ export function MyRuntimeProvider({
   });
 
   const agent = useMemo(() => {
-    // GraphRAG emits legacy THINKING_* events. @ag-ui/client 0.0.59 only
-    // auto-maps those to REASONING_* when maxVersion <= 0.0.45, and otherwise
-    // drops them — so without this shim the reasoning panel never appears.
+    // GraphRAG emits native REASONING_* events directly, so no
+    // compatibility shim is needed for the reasoning panel to appear.
     return new HttpAgent({
       url: AGUI_AGENT_URL,
       threadId: currentThreadId,
       headers: {
         Accept: "text/event-stream",
       },
-    }).use(new BackwardCompatibility_0_0_45());
+    });
   }, [currentThreadId]);
 
   const threadListAdapter = useMemo(
