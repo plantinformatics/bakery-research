@@ -38,19 +38,31 @@ A Retrieval-Augmented Generation (RAG) pipeline for plant biology research, buil
 
 ### Build the literature graph — `BuildLiteraturePretzelDocuementationGraph.py`
 
-Loads Markdown files, splits them into chunks, embeds + upserts them into Neo4j, then uses an LLM to extract entities/relationships according to a schema.
+Loads Markdown files (or a single Markdown file), splits them into chunks, embeds + upserts them into Neo4j, then uses an LLM to extract entities/relationships according to a schema.
+
+The script is driven by a CLI (`argparse`) — no need to edit the file to change modes/paths:
 
 ```bash
-uv run python BuildLiteraturePretzelDocuementationGraph.py
+uv run python BuildLiteraturePretzelDocuementationGraph.py --mode build
+uv run python BuildLiteraturePretzelDocuementationGraph.py --mode add
+uv run python BuildLiteraturePretzelDocuementationGraph.py --mode add_sup
+uv run python BuildLiteraturePretzelDocuementationGraph.py --mode add_pretzel
 ```
 
-Before running, check/edit the `mode` variable and paths inside `main()` at the bottom of the file:
+Modes (`--mode`, required):
 
-- `mode = "build"` — full build from `md_dir/` (initial load).
-- `mode = "add"` — incrementally add new documents from `add_dir/`.
-- `mode = "add_pretzel_functions"` — load Pretzel documentation chunks (set `pretzel_functions_dir` first).
+- `build` — full build from `md_dir/` (initial load): chunk + embed + upsert, create vector/full-text indexes, then extract entities/relationships.
+- `add` — incrementally add new documents from `add_dir/`, embedding **and** extracting nodes/relationships.
+- `add_sup` — incrementally add new documents from `add_dir/` **without** node/relationship extraction (chunks + embeddings only).
+- `add_pretzel` — load Pretzel documentation chunks from `add_pretzel_functions/` into the separate `PretzelFunction` vector/full-text indexes.
 
-This script also requires a schema file (`schema.yaml` by default, referenced in `main()`) describing allowed node types and relationships as YAML, e.g.:
+Optional flags:
+
+- `--dir PATH` — override the input directory for the selected mode (defaults: `md_dir/` for `build`, `add_dir/` for `add`/`add_sup`, `add_pretzel_functions/` for `add_pretzel`).
+- `--file PATH` — process a single Markdown file instead of a directory (mutually exclusive with `--dir`).
+- `--schema PATH` — path to the schema YAML (defaults to `schema.yaml` in this folder).
+
+This script requires a schema file (`schema.yaml` by default) describing allowed node types and relationships as YAML, e.g.:
 
 ```yaml
 entities:
@@ -62,9 +74,9 @@ relationships:
     to: Trait
 ```
 
-This file does not currently exist in the repo — create it before running, or point `schema` in `main()` at your own schema file.
+`schema.yaml` is git-ignored (see `.gitignore`) and not included in the repo — create your own before running, or point `--schema` at a different file.
 
-Progress is appended to `build.log` / `add.log` / `addpretzelfunctions.log`, and any chunks that fail extraction after all retries are appended to `failed_docs.jsonl`.
+Logging (`setup_logging`) writes to both the console and the mode's log file (`build.log` / `add.log` / `addpretzelfunctions.log`) simultaneously. Any chunks that fail extraction after all retries are appended to `failed_docs.jsonl`.
 
 ### Ask a question from the command line — `Query.py`
 
@@ -86,9 +98,12 @@ This starts `POST /agent`, which accepts an AG-UI `RunAgentInput` payload and st
 
 ## Data directories
 
-- `md_dir/` — source Markdown documents used for the initial literature graph `build`.
-- `add_dir/` — new documents to incrementally `add` to the literature graph.
+- `md_dir/` — source Markdown documents used for the initial literature graph `build` (e.g. `Abbott 1991.pdf.md`, `Coulter 2018.pdf.md`, `Wang 2020.pdf.md`).
+- `add_dir/` — new documents to incrementally `add`/`add_sup` to the literature graph.
+- `add_pretzel_functions/` — Pretzel documentation chunks used by `add_pretzel`.
+
+Any of these can be overridden per-run with `--dir`/`--file` (see above).
 
 ## Logs
 
-Each pipeline stage writes its own append-only log file in this folder: `build.log`, `add.log`, `addpretzelfunctions.log`. These (and `failed_docs.jsonl`) are useful for resuming/debugging long-running ingestion jobs that retry with backoff on transient API failures.
+Each pipeline mode writes its own append-only log file in this folder — `build.log`, `add.log`, `addpretzelfunctions.log` — and mirrors the same output to the console. These (and `failed_docs.jsonl`) are useful for resuming/debugging long-running ingestion jobs that retry with backoff on transient API failures.

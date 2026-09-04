@@ -491,19 +491,19 @@ wheels = [
 [[package]]
 name = "graphrag"
 version = "0.1.0"
-source = { editable = "." }
+source = { virtual = "." }
 dependencies = [
     { name = "ag-ui-protocol" },
     { name = "fastapi" },
     { name = "langchain-community" },
     { name = "langchain-core" },
-    { name = "langchain-experimental" },
     { name = "langchain-google-genai" },
     { name = "langchain-neo4j" },
     { name = "langchain-text-splitters" },
     { name = "neo4j" },
     { name = "numpy" },
     { name = "pydantic" },
+    { name = "python-dotenv" },
     { name = "rdflib" },
     { name = "requests" },
     { name = "uvicorn" },
@@ -515,13 +515,13 @@ requires-dist = [
     { name = "fastapi", specifier = ">=0.141.1" },
     { name = "langchain-community", specifier = ">=0.4.2" },
     { name = "langchain-core", specifier = ">=1.6.0" },
-    { name = "langchain-experimental", specifier = ">=0.4.2" },
     { name = "langchain-google-genai", specifier = ">=4.3.5" },
     { name = "langchain-neo4j", specifier = ">=0.10.0" },
     { name = "langchain-text-splitters", specifier = ">=1.1.2" },
     { name = "neo4j", specifier = ">=6.2.0" },
     { name = "numpy", specifier = ">=2.5.2" },
     { name = "pydantic", specifier = ">=2.13.4" },
+    { name = "python-dotenv", specifier = ">=1.0.0" },
     { name = "rdflib", specifier = ">=7.6.0" },
     { name = "requests", specifier = ">=2.34.2" },
     { name = "uvicorn", specifier = ">=0.52.4" },
@@ -710,19 +710,6 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/97/88/ebc98df187c525d729725ab39759337c56d5d2803423632376aa35bde899/langchain_core-1.6.0.tar.gz", hash = "sha256:dc72e36678ed26683ec0ad8829b44011fba461d10f9b31dbd9110215e5ec2333", size = 992493, upload-time = "2026-08-19T15:55:40.642Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/84/4c/508a90b9d2e3bd7738fd93cb2ac2178ce734662c75e69b3b81c445f1b360/langchain_core-1.6.0-py3-none-any.whl", hash = "sha256:d8bb924cd413955d9d3192ccced140407427c3ff51e50ffb941222648da92cb2", size = 570006, upload-time = "2026-08-19T15:55:38.935Z" },
-]
-
-[[package]]
-name = "langchain-experimental"
-version = "0.4.2"
-source = { registry = "https://pypi.org/simple" }
-dependencies = [
-    { name = "langchain-community" },
-    { name = "langchain-core" },
-]
-sdist = { url = "https://files.pythonhosted.org/packages/d9/1c/8240195c1b27f2c45b2ee93a07b2a5a466c92dec8881fc1213ec8e3cb6a8/langchain_experimental-0.4.2.tar.gz", hash = "sha256:1130fa7ecad5959e687295b2f7850ae3e5d8eeee6796bf9e99910806475d8acc", size = 172068, upload-time = "2026-05-22T20:38:42.184Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/f1/ce/5c56f08407648ab897b119a4add46391560a144285cf89e060091bc793e9/langchain_experimental-0.4.2-py3-none-any.whl", hash = "sha256:fd98b9948cb6f991e0f632ea3d5fb839bcfe21e6d5a190a51126a76270a66d40", size = 211226, upload-time = "2026-05-22T20:38:40.678Z" },
 ]
 
 [[package]]

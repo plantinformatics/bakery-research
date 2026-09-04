@@ -1,6 +1,6 @@
 from langchain_core.documents.base import Document
 import os, glob, hashlib, json, argparse
-from typing import List, Literal, Tuple
+from typing import Any, List, Literal, Tuple
 import rdflib
 import asyncio
 from rdflib.namespace import RDF
@@ -57,6 +57,20 @@ def get_retry_wait_s(attempts: int, strategy: RetryStrategy = "exponential") -> 
             wait_min,
         )
     return wait_min * 60.0
+
+
+# Logging goes to console and and respective log files
+def setup_logging(log_file: str) -> None:
+    formatter = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
+    file_handler = logging.FileHandler(log_file, mode="a", encoding="utf-8")
+    file_handler.setFormatter(formatter)
+    console_handler = logging.StreamHandler()
+    console_handler.setFormatter(formatter)
+    logging.basicConfig(
+        level=logging.INFO,
+        handlers=[file_handler, console_handler],
+        force=True,
+    )
 
 
 # def parse_schema_for_llm(schema_path: str) -> Tuple[List[str], List[Tuple[str, str, str]]]:
@@ -147,10 +161,17 @@ class PlantBioRAG:
         self.failed_docs_file = Path(r"failed_docs.jsonl")
 
     # Part 1: Build
-    # 1. Load markdown files from folder and split to Documents.
-    def load_and_split(self, dir) -> List[Document]:
+    # 1. Load markdown files from a folder or a single file and split to Documents.
+    def load_and_split(self, path) -> List[Document]:
         all_chunks = []
-        for path in glob.glob(os.path.join(dir, "**", "*.md"), recursive=True):
+        if os.path.isfile(path):
+            paths = [path]
+        else:  # route if directory is supplied
+            paths = glob.glob(os.path.join(path, "**", "*.md"), recursive=True)
+        if not paths:
+            logging.warning("No markdown files found at %s", path)
+            return all_chunks
+        for path in paths:
             with open(path, "r", encoding="utf-8") as f:
                 content = f.read()
             # Split by header first
@@ -251,11 +272,12 @@ class PlantBioRAG:
             )
         xformer = LLMGraphTransformer(
             llm=self.extraction_llm,
+            allowed_nodes=self.allowed_nodes,
             allowed_relationships=self.allowed_rels,
         )
 
         max_retries = GLOBAL_MAX_RETRIES
-        batch_size = 4
+        batch_size = 8
         logging.info(f"len(chunks): {len(chunks)}")
 
         input_tokens_sum = 0
@@ -349,15 +371,13 @@ class PlantBioRAG:
 
     def build(self):
         try:
-            logging.basicConfig(
-                filename=r"build.log",
-                level=logging.INFO,
-                format="%(asctime)s [%(levelname)s] %(message)s",
-                filemode="a",
-            )
+            setup_logging(r"build.log")
             logging.info("Build started.")
 
             docs = self.load_and_split(self.md_dir)
+            if not docs:
+                logging.warning("No documents to process at", self.md_dir)
+                return
             logging.info("Completed load_and_split")
 
             self.upsert_chunks_and_vectors(docs)
@@ -369,7 +389,7 @@ class PlantBioRAG:
             self.extract_graph_and_link_mentions(docs)
             logging.info("Build completed.")
         except Exception as e:
-            print(e)
+            logging.exception(e)
 
     def upsert_chunks_without_vectors(self, docs: List[Document]):
         rows = [
@@ -393,15 +413,13 @@ class PlantBioRAG:
     # Add documents
     def add(self, extract_nodes):
         try:
-            logging.basicConfig(
-                filename=r"add.log",
-                level=logging.INFO,
-                format="%(asctime)s [%(levelname)s] %(message)s",
-                filemode="a",
-            )
+            setup_logging(r"add.log")
             logging.info("Add started.")
 
             docs = self.load_and_split(self.add_dir)
+            if not docs:
+                logging.warning("No documents to process at", self.add_dir)
+                return
             logging.info("Completed load_and_split")
 
             if extract_nodes:
@@ -413,7 +431,7 @@ class PlantBioRAG:
             else:
                 self.upsert_chunks_without_vectors(docs)
         except Exception as e:
-            print(e)
+            logging.exception(e)
 
     def upsert_pretzel_functions_and_vectors(self, docs: List[Document]):
         self.graph.query(
@@ -462,39 +480,87 @@ class PlantBioRAG:
 
     def add_pretzel_functions(self):
         try:
-            logging.basicConfig(
-                filename=r"addpretzelfunctions.log",
-                level=logging.INFO,
-                format="%(asctime)s [%(levelname)s] %(message)s",
-                filemode="a",
-            )
+            setup_logging(r"addpretzelfunctions.log")
             logging.info("Add pretzel functions started.")
 
             docs = self.load_and_split(self.pretzel_functions_dir)
+            if not docs:
+                logging.warning("No documents to process; exiting.")
+                return
             logging.info("Completed load_and_split")
 
             self.upsert_pretzel_functions_and_vectors(docs)
             logging.info("Completed upsert_chunks_and_vectors")
         except Exception as e:
-            print(e)
+            logging.exception(e)
 
 
 def main():
-    mode = "build"
     here = Path(__file__).resolve().parent
+    parser = argparse.ArgumentParser(
+        description="Build or incrementally add to the literature and pretzel documentation graph.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "modes:\n"
+            "  build        full graph from literature\n"
+            "  add          add docs with node extraction\n"
+            "  add_sup      add docs without node extraction\n"
+            "  add_pretzel  add pretzel function docs"
+        ),
+    )
+    parser.add_argument(
+        "--mode",
+        required=True,
+        choices=["build", "add", "add_sup", "add_pretzel"],
+        help="Operation to run. See modes below.",
+    )
+    input_group = parser.add_mutually_exclusive_group()
+    input_group.add_argument(
+        "--dir",
+        default=None,
+        help=(
+            "Input markdown directory. Defaults: md_dir (build), "
+            "add_dir (add, add_sup), add_pretzel_functions (add_pretzel)."
+        ),
+    )
+    input_group.add_argument(
+        "--file",
+        default=None,
+        help="Process a single markdown file instead of a directory.",
+    )
+    parser.add_argument(
+        "--schema",
+        default=None,
+        help="Path to schema YAML. Defaults to schema.yaml in the same folder.",
+    )
+    args = parser.parse_args()
+
+    if args.file is not None and not os.path.isfile(args.file):
+        parser.error(f"File not found: {args.file}")
+
     md_dir = str(here / "md_dir")
     add_dir = str(here / "add_dir")
-    pretzel_functions_dir = r""  # add when we add pretzel docs
-    extract_nodes = True
-    schema = str(here / "schema.yaml")
+    pretzel_functions_dir = str(here / "add_pretzel_functions")
+    schema = args.schema if args.schema is not None else str(here / "schema.yaml")
+
+    input_path = args.file if args.file is not None else args.dir
+    if input_path is not None:
+        if args.mode == "build":
+            md_dir = input_path
+        elif args.mode in ("add", "add_sup"):
+            add_dir = input_path
+        elif args.mode == "add_pretzel":
+            pretzel_functions_dir = input_path
 
     rag = PlantBioRAG(md_dir, add_dir, pretzel_functions_dir, schema)
 
-    if mode == "build":
+    if args.mode == "build":
         rag.build()
-    elif mode == "add":
-        rag.add(extract_nodes)
-    elif mode == "add_pretzel_functions":
+    elif args.mode == "add":
+        rag.add(extract_nodes=True)
+    elif args.mode == "add_sup":
+        rag.add(extract_nodes=False)
+    elif args.mode == "add_pretzel":
         rag.add_pretzel_functions()
 
 
