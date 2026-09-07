@@ -30,7 +30,7 @@ const ThreadWelcome: FC = () => {
   return (
     <div className="aui-thread-welcome-root mb-6 flex flex-col items-center px-4 text-center">
       <h1 className="aui-thread-welcome-message-inner fade-in slide-in-from-bottom-1 animate-in fill-mode-both text-2xl font-medium tracking-tight duration-200">
-        Plant biology GraphRAG
+        Bakery Research
       </h1>
       <p className="text-muted-foreground fade-in slide-in-from-bottom-1 animate-in mt-2 max-w-md text-sm [animation-delay:80ms]">
         Ask about literature, Pretzel, or Australian Grains Genebank accessions.

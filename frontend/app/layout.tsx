@@ -4,7 +4,7 @@ import { MyRuntimeProvider } from "@/app/MyRuntimeProvider";
 import "./globals.css";
 
 export const metadata: Metadata = {
-  title: "Plant biology GraphRAG",
+  title: "Bakery Research",
   description:
     "Chat with the plant biology GraphRAG pipeline over the AG-UI protocol.",
 };
