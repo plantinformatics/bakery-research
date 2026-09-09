@@ -18,6 +18,10 @@ export type PlantBioRunState = {
   needs_clarification?: boolean;
   accessions?: string[];
   usage_metadata?: Record<string, unknown>;
+  /** Raw context retrieved from Neo4j and injected into the answer prompt. */
+  literature_context?: string | null;
+  metadata_context?: string | null;
+  pretzel_context?: string | null;
   error?: string | null;
 };
 

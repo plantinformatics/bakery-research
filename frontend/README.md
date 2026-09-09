@@ -38,7 +38,7 @@ Open `http://localhost:3000`. The chat streams thinking traces, the answer, and 
 ## What is wired
 
 - `@assistant-ui/react-ag-ui` + `HttpAgent` → FastAPI `POST /agent`
-- `STATE_SNAPSHOT` events (`RunState` from `Query.py`) → the pipeline status bar
+- `STATE_SNAPSHOT` events (`RunState` from `Query.py`) → the pipeline status bar, including a "Show retrieved context" disclosure with the raw literature / metadata-graph / Pretzel-docs text pulled from Neo4j and injected into the answer prompt
 - `THINKING_*` / `TEXT_MESSAGE_*` events → reasoning + answer in the thread
 - Suggested prompts are GraphRAG example questions, not the stock assistant-ui demo tools
 

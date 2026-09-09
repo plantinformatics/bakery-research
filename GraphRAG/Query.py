@@ -93,6 +93,14 @@ class RunState(BaseModel):
     needs_clarification: bool = False
     accessions: List[str] = Field(default_factory=list)
     usage_metadata: dict = Field(default_factory=dict)
+    # Raw context strings retrieved from Neo4j and injected into the
+    # answer-generation prompt by `_build_answer_prompt` (see there for the
+    # exact `### [Source: ...]` framing each is wrapped in). Exposed here so
+    # callers (e.g. the frontend's pipeline status panel) can inspect exactly
+    # what was retrieved, independent of the final cited answer text.
+    literature_context: Optional[str] = None
+    metadata_context: Optional[str] = None
+    pretzel_context: Optional[str] = None
     error: Optional[str] = None
 
 
@@ -1282,6 +1290,17 @@ class PlantBioRAG:
                 end_time - start_time,
             )
 
+            # Expose exactly what was retrieved from Neo4j and will be added
+            # to the answer-generation prompt, so it can be inspected without
+            # having to parse the prompt/answer itself.
+            state = state.model_copy(
+                update={
+                    "literature_context": literature_context or None,
+                    "metadata_context": metadata_context or None,
+                    "pretzel_context": pretzel_context or None,
+                }
+            )
+
             prompt = self._build_answer_prompt(
                 expanded_question,
                 q,
@@ -1431,6 +1450,14 @@ def main():
         if final_state.error:
             logger.error("Run error: %s", final_state.error)
         logger.info("Token Usage: %s", str(final_state.usage_metadata))
+        for label, ctx in (
+            ("Literature", final_state.literature_context),
+            ("Metadata Graph", final_state.metadata_context),
+            ("Pretzel Documentation", final_state.pretzel_context),
+        ):
+            logger.info(
+                "Retrieved context [%s]: %d chars", label, len(ctx) if ctx else 0
+            )
 
 
 if __name__ == "__main__":
