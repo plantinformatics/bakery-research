@@ -3,24 +3,23 @@ from typing import Any, Dict, List, Optional
 from neo4j import GraphDatabase, basic_auth
 from langchain_google_genai import GoogleGenerativeAIEmbeddings
 
-os.environ["GOOGLE_API_KEY"] = ""
+NEO4J_URI = os.environ["NEO4J_URI"];
+NEO4J_USER = os.environ["NEO4J_USERNAME"];
+NEO4J_PASS = os.environ["NEO4J_PASSWORD"];
 
-os.environ["NEO4J_URI"] = ""
-os.environ["NEO4J_USERNAME"] = ""
-os.environ["NEO4J_PASSWORD"] = ""
 
 GEMINI_EMBEDDING_MODEL = "models/gemini-embedding-001"
 GEMINI_EMBEDDING_DIMS = 3072
 
 FILES = {
-    "alignment": r"251027_Metadata_Fields_Update(Alignment).csv",
-    "curator": r"251027_Metadata_Fields_Update(Curator).csv",
-    "accession": r"251027_Metadata_Fields_Update(DatasetAccession).csv",
-    "genetic_map": r"251027_Metadata_Fields_Update(Genetic Map).csv",
-    "genome": r"251027_Metadata_Fields_Update(Genome).csv",
-    "project": r"251027_Metadata_Fields_Update(Project).csv",
-    "qtl": r"251027_Metadata_Fields_Update(QTL).csv",
-    "vcf": r"251027_Metadata_Fields_Update(VCF).csv",
+    "alignment": r"Alignment.csv",
+    "curator": r"Curator.csv",
+    "accession": r"DatasetAccession.csv",
+    "genetic_map": r"Genetic Map.csv",
+    "genome": r"Genome.csv",
+    "project": r"Project.csv",
+    "qtl": r"QTL.csv",
+    "vcf": r"VCF.csv",
 }
 
 emb_model = GoogleGenerativeAIEmbeddings(model=GEMINI_EMBEDDING_MODEL)
