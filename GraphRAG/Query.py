@@ -176,6 +176,9 @@ A QTL dataset defines single positions or intervals within a Genome or Genetic M
 - As described above, a QTL defined in either a Genome or Genetic Map can be projected to another Genome or Genetic Map
 - Thus, the genes underlying a QTL can be identified by projecting a QTL into a Genome where an Annotation dataset defines the genes in the sequence
 - In this way, combining all the above, genes underlying QTLs for a given trait can be found 
+
+A donor of a gene is also a carrier of the gene. For example, if accession A is the donor of gene X, then accession A is a carrier of gene X.
+
 """
 
 
