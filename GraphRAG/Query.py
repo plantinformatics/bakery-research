@@ -179,6 +179,9 @@ A QTL dataset defines single positions or intervals within a Genome or Genetic M
 
 A donor of a gene is also a carrier of the gene. For example, if accession A is the donor of gene X, then accession A is a carrier of gene X.
 
+If a gene is transferred into an existing accession or variety, then the existing accession does not carry the gene while the new accession which includes the transferred gene has it.
+For example if Lr46 has been transferred into Avocet, then Avocet does NOT carry Lr46 while the resulting accession (often referred to as Avocet+Lr46 for example) does.
+
 """
 
 
