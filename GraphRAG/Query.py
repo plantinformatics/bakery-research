@@ -23,6 +23,8 @@ from dotenv import load_dotenv
 
 load_dotenv(Path(__file__).resolve().parents[1] / ".env")
 
+useCache = os.getenv("USE_CACHE") or False
+
 warnings.simplefilter("ignore", DeprecationWarning)
 
 logging.basicConfig(
@@ -209,8 +211,9 @@ class PlantBioRAG:
             embedding_node_property="embedding",
             index_name="vector",
         )
-        self._ensure_semantic_cache_vector_index()
-        self._clear_expired_semantic_cache()
+        if useCache:
+            self._ensure_semantic_cache_vector_index()
+            self._clear_expired_semantic_cache()
 
     def _ensure_semantic_cache_vector_index(self) -> None:
         try:
@@ -1211,11 +1214,16 @@ class PlantBioRAG:
         logger.info(f"Start query.")
         state = RunState(stage=Stage.EXPANDING_QUESTION)
         try:
-            start_time = time.perf_counter()
-            q_emb = await asyncio.to_thread(self.emb.embed_query, q)
-            cached = await asyncio.to_thread(self._semantic_cache_lookup, q_emb)
-            end_time = time.perf_counter()
-            logger.info(f"0. Semantic cache lookup: {end_time - start_time:0.1f} sec.")
+            cached = None
+            q_emb = None
+            if useCache:
+                start_time = time.perf_counter()
+                q_emb = await asyncio.to_thread(self.emb.embed_query, q)
+                cached = await asyncio.to_thread(self._semantic_cache_lookup, q_emb)
+                end_time = time.perf_counter()
+                logger.info(
+                    f"0. Semantic cache lookup: {end_time - start_time:0.1f} sec."
+                )
 
             if cached:
                 cached_expanded_question, cached_answer, _cached_usage = cached
@@ -1346,14 +1354,15 @@ class PlantBioRAG:
                     "barley, oat, chickpea)."
                 )
                 # Leaving this in for the moment until we add something filter out unrelated queries
-                await asyncio.to_thread(
-                    self._semantic_cache_store,
-                    q,
-                    expanded_question,
-                    full_answer,
-                    usage_metadata,
-                    q_emb,
-                )
+                if useCache:
+                    await asyncio.to_thread(
+                        self._semantic_cache_store,
+                        q,
+                        expanded_question,
+                        full_answer,
+                        usage_metadata,
+                        q_emb,
+                    )
                 yield ResultEvent(state=state)
                 return
 
@@ -1413,14 +1422,15 @@ class PlantBioRAG:
                 full_answer += appended_text
                 yield TextEvent(text=appended_text)
 
-            await asyncio.to_thread(
-                self._semantic_cache_store,
-                q,
-                expanded_question,
-                full_answer,
-                usage_metadata,
-                q_emb,
-            )
+            if useCache:
+                await asyncio.to_thread(
+                    self._semantic_cache_store,
+                    q,
+                    expanded_question,
+                    full_answer,
+                    usage_metadata,
+                    q_emb,
+                )
             yield ResultEvent(state=state)
         except Exception as e:
             logger.exception("query() failed: %s", e)
