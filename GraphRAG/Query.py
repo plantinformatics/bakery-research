@@ -186,6 +186,8 @@ For example if Lr46 has been transferred into Avocet, then Avocet does NOT carry
 
 When referencing Pretzel datasets, only refer to datasets exactly as they are in the metadata graph and do not hallucinate any part of the dataset name such as versions or trait names.
 
+When reporting accessions that carry specific genes, do not refer to accessions or varieties into which genes were transferred or introgressed. For example, if Lr46 was transferred into Avocet, do not list Avocet as a carrier of the gene unless the new accessions carrying the gene has a distinct name to differentiate it from the original accession that does not carry the gene.
+
 """
 
 
