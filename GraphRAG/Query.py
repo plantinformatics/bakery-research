@@ -184,6 +184,8 @@ A donor of a gene is also a carrier of the gene. For example, if accession A is 
 If a gene is transferred into an existing accession or variety, then the existing accession does not carry the gene while the new accession which includes the transferred gene has it.
 For example if Lr46 has been transferred into Avocet, then Avocet does NOT carry Lr46 while the resulting accession (often referred to as Avocet+Lr46 for example) does.
 
+When referencing Pretzel datasets, only refer to datasets exactly as they are in the metadata graph and do not hallucinate any part of the dataset name such as versions or trait names.
+
 """
 
 
