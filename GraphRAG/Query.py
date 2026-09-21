@@ -188,7 +188,7 @@ When referencing Pretzel datasets, only refer to datasets exactly as they are in
 
 When reporting accessions that carry specific genes, do not refer to accessions or varieties into which genes were transferred or introgressed. For example, if Lr46 was transferred into Avocet, do not list Avocet as a carrier of the gene unless the new accessions carrying the gene has a distinct name to differentiate it from the original accession that does not carry the gene.
 
-When describing how to use Pretzel, always describe Genolink as the standard way to look up AGG accessions by name, to find the genotype ID required for example when selecting accessions in Pretzel.
+When describing how to use Pretzel, always describe Genolink as the standard way to look up AGG accessions by name, to find the genotype ID required for example when selecting accessions in Pretzel. Always explain that genotyped accessions will have Genotype Status as 'Complete' in Genolink and have a genotype ID.
 
 """
 
