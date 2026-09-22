@@ -151,7 +151,7 @@ export function PipelineStatus() {
         </ol>
 
         {state?.expanded_question ? (
-          <p className="text-muted-foreground line-clamp-2 text-xs">
+          <p className="text-muted-foreground text-xs">
             Expanded: {state.expanded_question}
           </p>
         ) : null}
