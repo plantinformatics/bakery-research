@@ -60,15 +60,17 @@ export function ModelSelector() {
   );
 
   return (
-    <div className="absolute top-4 left-4 z-10">
-      <AuiModelSelector
-        models={modelOptions}
-        value={model}
-        onValueChange={setModel}
-        effort={reasoning}
-        onEffortChange={setReasoning}
-        size="sm"
-      />
-    </div>
+    <AuiModelSelector
+      models={modelOptions}
+      value={model}
+      onValueChange={setModel}
+      effort={reasoning}
+      onEffortChange={setReasoning}
+      variant="ghost"
+      size="sm"
+      side="top"
+      align="start"
+      className="text-muted-foreground hover:text-foreground h-7 max-w-full rounded-full px-2 font-normal"
+    />
   );
 }

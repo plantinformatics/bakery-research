@@ -280,6 +280,7 @@ function ModelSelectorTrigger({
       data-slot="model-selector-trigger"
       data-variant={variant ?? "outline"}
       data-size={size ?? "default"}
+      type="button"
       role="combobox"
       aria-haspopup="listbox"
       className={cn(modelSelectorTriggerVariants({ variant, size }), className)}
@@ -678,6 +679,9 @@ export type ModelSelectorProps = Omit<ModelSelectorRootProps, "children"> &
     /** Alignment of the dropdown relative to the trigger. Use `"end"` when the
      * trigger sits at the right edge of its container. */
     align?: ModelSelectorContentProps["align"];
+    /** Preferred side for the dropdown. `"top"` when the trigger sits in a
+     * bottom-docked composer. Collision detection still flips it if needed. */
+    side?: ModelSelectorContentProps["side"];
     className?: string;
     contentClassName?: string;
   };

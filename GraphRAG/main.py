@@ -1,6 +1,6 @@
 import logging
 import uuid
-from typing import AsyncGenerator, Optional
+from typing import Any, AsyncGenerator, Optional, Tuple
 
 from ag_ui.core import (
     ReasoningEndEvent,
@@ -23,6 +23,10 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 
 from Query import (
+    ANSWER_THINKING_LEVEL,
+    AVAILABLE_MODELS,
+    AVAILABLE_REASONING_LEVELS,
+    GEMINI_MODEL,
     ErrorEvent,
     PlantBioRAG,
     ReasoningEvent,
@@ -45,6 +49,33 @@ app.add_middleware(
 
 # Shared across requests: holds the Neo4j/Gemini clients only, no per-run state.
 rag = PlantBioRAG()
+
+
+def _forwarded_model_selection(
+    input: RunAgentInput,
+) -> Tuple[Optional[str], Optional[str]]:
+    """Reads the frontend's model/reasoning selection out of `forwardedProps`.
+
+    `frontend/hooks/use-model-config.ts` publishes the selection as
+    `ModelContext.config.{modelName,reasoningEffort}`, which
+    `AgUiThreadRuntimeCore.buildRunInput` (in `@assistant-ui/react-ag-ui`)
+    spreads into `RunAgentInput.forwardedProps` on every run. `PlantBioRAG.
+    query()` re-validates whatever comes back here against
+    `AVAILABLE_MODELS`/`AVAILABLE_REASONING_LEVELS`: no selection at all
+    (older frontend build) falls back to its defaults, but a stale or
+    invalid explicit selection raises `UnavailableModelSelectionError`,
+    which the `except Exception` below turns into a `RunErrorEvent`
+    instead of silently answering with a different model than requested.
+    """
+    forwarded: Any = input.forwarded_props
+    if not isinstance(forwarded, dict):
+        return None, None
+    model_name = forwarded.get("modelName")
+    reasoning_level = forwarded.get("reasoningEffort")
+    return (
+        model_name if isinstance(model_name, str) else None,
+        reasoning_level if isinstance(reasoning_level, str) else None,
+    )
 
 
 def _latest_user_message(input: RunAgentInput) -> str:
@@ -84,8 +115,13 @@ async def _run_agui_events(input: RunAgentInput) -> AsyncGenerator[str, None]:
         reasoning_message_id = None
         return events
 
+    model_name, reasoning_level = _forwarded_model_selection(input)
     try:
-        async for event in rag.query(_latest_user_message(input)):
+        async for event in rag.query(
+            _latest_user_message(input),
+            model_name=model_name,
+            reasoning_level=reasoning_level,
+        ):
             if isinstance(event, StageChangeEvent):
                 yield encoder.encode(
                     StateSnapshotEvent(snapshot=event.state.model_dump(mode="json"))
@@ -151,3 +187,17 @@ async def run_agent(input: RunAgentInput) -> StreamingResponse:
     return StreamingResponse(
         _run_agui_events(input), media_type=encoder.get_content_type()
     )
+
+
+@app.get("/options")
+async def get_options() -> dict:
+    """Model/reasoning choices for the frontend's selectors
+    (`frontend/components/model-selector.tsx`), kept in sync with what
+    `PlantBioRAG.query()` actually accepts (`Query.py`'s `AVAILABLE_MODELS`/
+    `AVAILABLE_REASONING_LEVELS`)."""
+    return {
+        "models": AVAILABLE_MODELS,
+        "defaultModel": GEMINI_MODEL,
+        "reasoningLevels": AVAILABLE_REASONING_LEVELS,
+        "defaultReasoningLevel": ANSWER_THINKING_LEVEL,
+    }

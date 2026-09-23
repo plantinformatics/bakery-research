@@ -5,3 +5,15 @@ Avoid the use of wrapper functions who's only function is to avoid the changing 
 Avoid writing any custom components where possible. Try to stick to existing ones.
 
 Avoid killing and starting processes. The development enviroment is already set up. If it isn't ask me to start them up
+
+## assistant-ui
+
+This project uses assistant-ui for chat interfaces.
+
+Documentation: https://www.assistant-ui.com/llms-full.txt
+
+Key patterns:
+- Use AssistantRuntimeProvider at the app root
+- Thread component for full chat interface
+- AssistantModal for floating chat widget
+- useChatRuntime hook with AI SDK transport

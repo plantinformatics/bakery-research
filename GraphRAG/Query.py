@@ -1,5 +1,7 @@
-# RAG pipeline for plant biology papers using Neo4j + Gemini + LangChain
-# Requires env: GOOGLE_API_KEY, NEO4J_URI, NEO4J_USERNAME, NEO4J_PASSWORD
+# RAG pipeline for plant biology papers using Neo4j + Gemini/GPT + LangChain
+# Requires env: GOOGLE_API_KEY, OPENAI_API_KEY, NEO4J_URI, NEO4J_USERNAME,
+# NEO4J_PASSWORD. Importing this module (what `main.py` does at startup)
+# raises if any of those are missing or blank.
 
 import os
 import argparse
@@ -8,6 +10,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import AsyncGenerator, List, Dict, Optional, Tuple, Any, Union
 from langchain_google_genai import ChatGoogleGenerativeAI, GoogleGenerativeAIEmbeddings
+from langchain_openai import ChatOpenAI
 from langchain_neo4j import Neo4jGraph, Neo4jVector
 import requests
 import re
@@ -24,6 +27,32 @@ from dotenv import load_dotenv
 import prompts
 
 load_dotenv(Path(__file__).resolve().parents[1] / ".env")
+
+# Checked at import so `uvicorn main:app` (and the `Query.py` CLI) fail
+# before any client is constructed. `USE_CACHE` and `ACCESSION_API_URL`
+# stay optional: cache defaults off, and accession lookups already report
+# a missing URL when that path is used.
+REQUIRED_ENV_VARS = (
+    "GOOGLE_API_KEY",
+    "OPENAI_API_KEY",
+    "NEO4J_URI",
+    "NEO4J_USERNAME",
+    "NEO4J_PASSWORD",
+)
+
+
+def _require_env_vars() -> None:
+    missing = [name for name in REQUIRED_ENV_VARS if not os.getenv(name, "").strip()]
+    if not missing:
+        return
+    raise RuntimeError(
+        "Missing required environment variables: "
+        + ", ".join(missing)
+        + ". Set them in the repository root .env file or the process environment."
+    )
+
+
+_require_env_vars()
 
 useCache = os.getenv("USE_CACHE") or False
 
@@ -45,12 +74,118 @@ logging.getLogger("neo4j.notifications").setLevel(
 logger = logging.getLogger(__name__)
 
 GEMINI_MODEL = "gemini-3.8-flash"
+# GPT models selectable alongside the Gemini models below. Routed through
+# `ChatOpenAI` (OpenAI's Responses API) instead of `ChatGoogleGenerativeAI`
+# - see `_model_provider`/`_get_answer_llm`.
+GPT_MODEL = "gpt-5.6-luna"
+GPT_SOL_MODEL = "gpt-5.6-sol"
 GEMINI_EMBEDDING_MODEL = "models/gemini-embedding-001"
 # How hard the model reasons before producing the final answer (Gemini 3+
 # models only; replaces the older token-based `thinking_budget`).
 # One of "minimal", "low", "medium", "high" - higher levels reason more
 # deeply at the cost of latency/tokens. Unset defaults to "high".
 ANSWER_THINKING_LEVEL = "medium"
+
+# Answer-generation models selectable from the frontend's model selector
+# (see `frontend/components/model-selector.tsx`), and the thinking/reasoning
+# levels selectable from its reasoning selector. `GraphRAG/main.py` exposes
+# these via `GET /options` so the frontend has a single source of truth to
+# populate the two dropdowns from. `PlantBioRAG.query()` falls back to the
+# first/`ANSWER_THINKING_LEVEL` defaults only when no selection was made at
+# all (e.g. an older frontend build); an explicit-but-unrecognised value
+# (a stale selection, a bad actor) fails the run instead of silently
+# substituting a different model than the one requested - see
+# `_resolve_model_name`/`_resolve_reasoning_level`.
+#
+# Spans two providers: Gemini models go through `ChatGoogleGenerativeAI`,
+# `GPT_MODEL`/`GPT_SOL_MODEL` go through `ChatOpenAI` (see `_model_provider`).
+# Both providers happen to use the same "minimal"/"low"/"medium"/"high"
+# reasoning-effort vocabulary, so `AVAILABLE_REASONING_LEVELS` is shared
+# across all of `AVAILABLE_MODELS` without per-model overrides.
+AVAILABLE_MODELS = [GEMINI_MODEL, "gemini-2.5-flash", GPT_MODEL, GPT_SOL_MODEL]
+AVAILABLE_REASONING_LEVELS = ["minimal", "low", "medium", "high"]
+
+# `thinking_budget` values (in tokens) used for the reasoning selector on
+# Gemini models that predate `thinking_level` (e.g. gemini-2.5-flash, which
+# rejects `thinking_level` outright with an API 400 - "Thinking level is
+# not supported for this model"). Kept in the same "minimal" -> "high"
+# vocabulary as `AVAILABLE_REASONING_LEVELS` so the selector behaves
+# consistently across model families, even though the underlying Gemini
+# API parameter differs. Not used for GPT models, which take
+# `reasoning_level` directly as OpenAI's `reasoning_effort`.
+REASONING_LEVEL_TO_THINKING_BUDGET = {
+    "minimal": 0,
+    "low": 1024,
+    "medium": 8192,
+    "high": 24576,
+}
+
+
+def _model_provider(model_name: str) -> str:
+    """"openai" for GPT models (routed through `ChatOpenAI`/the Responses
+    API), "google" for everything else (Gemini, via
+    `ChatGoogleGenerativeAI`). Add new GPT models to `AVAILABLE_MODELS`
+    freely - anything named "gpt-*" is picked up automatically."""
+    return "openai" if model_name.startswith("gpt-") else "google"
+
+
+def _model_supports_thinking_level(model_name: str) -> bool:
+    """Only Gemini 3+ models accept `thinking_level`/`reasoning_effort`."""
+    return model_name.startswith("gemini-3")
+
+
+def _thinking_kwargs(model_name: str, reasoning_level: str) -> Dict[str, Any]:
+    """Translates a resolved reasoning level into whichever thinking
+    parameter `model_name` actually accepts, for use both when constructing
+    a `ChatGoogleGenerativeAI` and on each `astream`/`invoke` call. Only
+    called for `_model_provider(model_name) == "google"` - GPT models take
+    their reasoning effort at construction time instead (see
+    `_get_answer_llm`)."""
+    if _model_supports_thinking_level(model_name):
+        return {"thinking_level": reasoning_level}
+    return {"thinking_budget": REASONING_LEVEL_TO_THINKING_BUDGET[reasoning_level]}
+
+
+class UnavailableModelSelectionError(ValueError):
+    """Raised by `_resolve_model_name`/`_resolve_reasoning_level` when the
+    caller explicitly asked for a model/reasoning level that isn't in
+    `AVAILABLE_MODELS`/`AVAILABLE_REASONING_LEVELS`. Raised (not
+    substituted) deliberately: silently answering with a different model
+    than the one requested would be misleading, so `query()` lets this
+    propagate and fail the run - `main.py`'s `_run_agui_events` turns it
+    into a `RunErrorEvent`, and the CLI in this file's `main()` just lets
+    it crash (its `--model`/`--reasoning-level` choices are already
+    restricted by argparse, so it shouldn't be reachable from the CLI)."""
+
+
+def _resolve_model_name(model_name: Optional[str]) -> str:
+    """No selection at all (`None`/empty - e.g. an older frontend build)
+    falls back to the default model. An explicit-but-unrecognised
+    selection is a hard failure instead - see
+    `UnavailableModelSelectionError`."""
+    if not model_name:
+        return GEMINI_MODEL
+    if model_name in AVAILABLE_MODELS:
+        return model_name
+    raise UnavailableModelSelectionError(
+        f"Unknown model {model_name!r} requested; available models are "
+        f"{AVAILABLE_MODELS}"
+    )
+
+
+def _resolve_reasoning_level(reasoning_level: Optional[str]) -> str:
+    """Same fallback-vs-fail policy as `_resolve_model_name`, for the
+    reasoning level."""
+    if not reasoning_level:
+        return ANSWER_THINKING_LEVEL
+    if reasoning_level in AVAILABLE_REASONING_LEVELS:
+        return reasoning_level
+    raise UnavailableModelSelectionError(
+        f"Unknown reasoning level {reasoning_level!r} requested; available "
+        f"levels are {AVAILABLE_REASONING_LEVELS}"
+    )
+
+
 MAX_CHARACTERS = 600000
 MAX_TRIPLES = 50
 QUERY_VECTOR_MAX_CHUNKS = 40
@@ -92,6 +227,11 @@ class RunState(BaseModel):
 
     stage: Stage
     expanded_question: Optional[str] = None
+    # Answer-generation model/reasoning level actually used for this run,
+    # after `_resolve_model_name`/`_resolve_reasoning_level` have applied
+    # their fallbacks - lets the frontend confirm the selection took effect.
+    model_name: str = GEMINI_MODEL
+    reasoning_level: str = ANSWER_THINKING_LEVEL
     species: str = ""
     is_agg_accession_query: bool = False
     needs_clarification: bool = False
@@ -144,16 +284,17 @@ RunEvent = Union[StageChangeEvent, TextEvent, ReasoningEvent, ResultEvent, Error
 class PlantBioRAG:
     def __init__(self):
         self.emb = GoogleGenerativeAIEmbeddings(model=GEMINI_EMBEDDING_MODEL)
+        # Fixed model for internal helper calls (question/query expansion,
+        # accession extraction/presentation) - these aren't exposed to the
+        # frontend's model/reasoning selectors, only the final answer is.
         self.llm = ChatGoogleGenerativeAI(model=GEMINI_MODEL, temperature=0)
-        # Separate client so only the final-answer call requests thought text.
-        # Other `_llm_invoke` calls (JSON extraction, accession presentation)
-        # would otherwise pay for unused thinking tokens.
-        self.answer_llm = ChatGoogleGenerativeAI(
-            model=GEMINI_MODEL,
-            temperature=0,
-            include_thoughts=True,
-            thinking_level=ANSWER_THINKING_LEVEL,
-        )
+        # Answer-generation clients, one per (model_name, reasoning_level)
+        # combo actually requested so far, built lazily by `_get_answer_llm`.
+        # Separate from `self.llm` so only the final-answer call requests
+        # thought text - other `_llm_invoke` calls (JSON extraction,
+        # accession presentation) would otherwise pay for unused thinking
+        # tokens.
+        self._answer_llm_cache: Dict[Tuple[str, str], ChatGoogleGenerativeAI] = {}
         self.graph = Neo4jGraph()
         self.vs = Neo4jVector(
             embedding=self.emb,
@@ -461,6 +602,10 @@ class PlantBioRAG:
     # LangChain's Google GenAI adapter stores thoughts as v0
     # `{type: "thinking", thinking: ...}` blocks on `.content`, and as v1
     # `{type: "reasoning", reasoning: ...}` blocks on `.content_blocks`.
+    # `ChatOpenAI` (with `output_version="responses/v1"`, set in
+    # `_get_answer_llm`) instead puts GPT's reasoning summary in a
+    # `{type: "reasoning", summary: [{type: "summary_text", text: ...}]}`
+    # block directly on `.content` - handled by the `summary` branch below.
     @staticmethod
     def _thinking_from_parts(parts: Any) -> str:
         if not isinstance(parts, list):
@@ -472,12 +617,18 @@ class PlantBioRAG:
             kind = part.get("type")
             if kind == "thinking":
                 text = part.get("thinking") or part.get("text") or ""
+                if isinstance(text, str) and text:
+                    pieces.append(text)
             elif kind == "reasoning":
                 text = part.get("reasoning") or part.get("text") or ""
-            else:
-                continue
-            if isinstance(text, str) and text:
-                pieces.append(text)
+                if isinstance(text, str) and text:
+                    pieces.append(text)
+                for summary_part in part.get("summary") or []:
+                    if not isinstance(summary_part, dict):
+                        continue
+                    summary_text = summary_part.get("text") or ""
+                    if isinstance(summary_text, str) and summary_text:
+                        pieces.append(summary_text)
         return "".join(pieces)
 
     @staticmethod
@@ -943,17 +1094,63 @@ class PlantBioRAG:
             pretzel_context = pretzel_future.result() if pretzel_future else ""
         return literature_context, metadata_context, pretzel_context
 
+    # Returns (building and caching, if necessary) the answer-generation
+    # client for one (model_name, reasoning_level) combo. Called with
+    # already-validated values from `_resolve_model_name`/
+    # `_resolve_reasoning_level`, so every distinct combo a user actually
+    # selects in the frontend gets its own client, reused across requests.
+    #
+    # Dispatches on `_model_provider`: GPT models go through `ChatOpenAI`
+    # with `reasoning_effort` set directly to `reasoning_level` (OpenAI
+    # uses the same "minimal"/"low"/"medium"/"high" vocabulary as
+    # `AVAILABLE_REASONING_LEVELS`), plus `output_version="responses/v1"`
+    # so the reasoning summary shows up as a `{"type": "reasoning", ...}`
+    # content block for `_message_thinking` to read - the OpenAI analogue
+    # of Gemini's `include_thoughts=True`. Reasoning-model temperature
+    # constraints are handled by `ChatOpenAI` itself (it silently drops an
+    # unsupported `temperature`), so none is passed here.
+    def _get_answer_llm(
+        self, model_name: str, reasoning_level: str
+    ) -> Union[ChatGoogleGenerativeAI, ChatOpenAI]:
+        key = (model_name, reasoning_level)
+        llm = self._answer_llm_cache.get(key)
+        if llm is None:
+            if _model_provider(model_name) == "openai":
+                llm = ChatOpenAI(
+                    model=model_name,
+                    reasoning_effort=reasoning_level,
+                    output_version="responses/v1",
+                )
+            else:
+                llm = ChatGoogleGenerativeAI(
+                    model=model_name,
+                    temperature=0,
+                    include_thoughts=True,
+                    **_thinking_kwargs(model_name, reasoning_level),
+                )
+            self._answer_llm_cache[key] = llm
+        return llm
+
     # Stage: GENERATING_ANSWER. Fatal by design: with no answer, there is
     # nothing useful left to yield, so `query()` lets this propagate up to
     # its outer `except` and end the run with an `ErrorEvent`. Streams the
     # response via `llm.astream` so `query()` can yield text chunks as they
     # arrive instead of blocking for the full answer.
-    async def _generate_answer_stream(self, prompt: Any) -> AsyncGenerator[Any, None]:
-        async for chunk in self.answer_llm.astream(
-            prompt,
-            thinking_level=ANSWER_THINKING_LEVEL,
-            include_thoughts=True,
-        ):
+    async def _generate_answer_stream(
+        self, prompt: Any, model_name: str, reasoning_level: str
+    ) -> AsyncGenerator[Any, None]:
+        llm = self._get_answer_llm(model_name, reasoning_level)
+        # Only the Gemini branch needs its thinking kwargs repeated on
+        # every call - `thinking_level`/`thinking_budget` can be
+        # overridden per `astream` call, unlike GPT's `reasoning_effort`,
+        # which `_get_answer_llm` already bakes in at construction time.
+        call_kwargs: Dict[str, Any] = {}
+        if _model_provider(model_name) == "google":
+            call_kwargs = {
+                "include_thoughts": True,
+                **_thinking_kwargs(model_name, reasoning_level),
+            }
+        async for chunk in llm.astream(prompt, **call_kwargs):
             yield chunk
 
     # Stages: CHECKING_AGG_ACCESSIONS. Extraction can itself fail (it calls
@@ -1015,10 +1212,36 @@ class PlantBioRAG:
     # the accession API. The next user message is expected to supply the
     # species in plain text, re-derived by `expand_question_and_queries`.
     async def query(
-        self, q: str, k: int = QUERY_MAX_CHUNKS, max_context_chars: int = MAX_CHARACTERS
+        self,
+        q: str,
+        k: int = QUERY_MAX_CHUNKS,
+        max_context_chars: int = MAX_CHARACTERS,
+        # Raw values as forwarded by the frontend's model/reasoning
+        # selectors (see `frontend/hooks/use-model-config.ts` and
+        # `GraphRAG/main.py`'s reading of `forwardedProps`). Resolved
+        # against `AVAILABLE_MODELS`/`AVAILABLE_REASONING_LEVELS` below
+        # before use: unset (`None`) falls back to the existing defaults,
+        # but an explicit-but-unrecognised value raises
+        # `UnavailableModelSelectionError` here - deliberately *not*
+        # caught below, so it propagates straight out of this generator
+        # and fails the run rather than silently answering with a
+        # different model than the one requested.
+        model_name: Optional[str] = None,
+        reasoning_level: Optional[str] = None,
     ) -> AsyncGenerator[RunEvent, None]:
         logger.info(f"Start query.")
-        state = RunState(stage=Stage.EXPANDING_QUESTION)
+        resolved_model_name = _resolve_model_name(model_name)
+        resolved_reasoning_level = _resolve_reasoning_level(reasoning_level)
+        logger.info(
+            "Using model=%s reasoning_level=%s",
+            resolved_model_name,
+            resolved_reasoning_level,
+        )
+        state = RunState(
+            stage=Stage.EXPANDING_QUESTION,
+            model_name=resolved_model_name,
+            reasoning_level=resolved_reasoning_level,
+        )
         try:
             # Classify before cache/retrieval so a direct AGG lookup can skip
             # GraphRAG when no suitable cached response exists.
@@ -1080,7 +1303,9 @@ class PlantBioRAG:
                 start_time = time.perf_counter()
                 answer_parts = []
                 full_chunk = None
-                async for chunk in self._generate_answer_stream(prompt):
+                async for chunk in self._generate_answer_stream(
+                    prompt, resolved_model_name, resolved_reasoning_level
+                ):
                     full_chunk = chunk if full_chunk is None else full_chunk + chunk
                     thinking = self._message_thinking(chunk)
                     if thinking:
@@ -1200,7 +1425,9 @@ class PlantBioRAG:
             start_time = time.perf_counter()
             answer_parts = []
             full_chunk = None
-            async for chunk in self._generate_answer_stream(prompt):
+            async for chunk in self._generate_answer_stream(
+                prompt, resolved_model_name, resolved_reasoning_level
+            ):
                 full_chunk = chunk if full_chunk is None else full_chunk + chunk
                 thinking = self._message_thinking(chunk)
                 if thinking:
@@ -1314,6 +1541,18 @@ def main():
     parser.add_argument(
         "query", type=str, help="The question you want to ask the RAG pipeline"
     )
+    parser.add_argument(
+        "--model",
+        choices=AVAILABLE_MODELS,
+        default=None,
+        help=f"Answer-generation model. Defaults to {GEMINI_MODEL}.",
+    )
+    parser.add_argument(
+        "--reasoning-level",
+        choices=AVAILABLE_REASONING_LEVELS,
+        default=None,
+        help=f"Answer-generation thinking level. Defaults to {ANSWER_THINKING_LEVEL}.",
+    )
     args = parser.parse_args()
 
     rag = PlantBioRAG()
@@ -1322,7 +1561,9 @@ def main():
         answer_parts = []
         final_state = None
         start_time = time.perf_counter()
-        async for event in rag.query(args.query):
+        async for event in rag.query(
+            args.query, model_name=args.model, reasoning_level=args.reasoning_level
+        ):
             if isinstance(event, TextEvent):
                 elapsed = time.perf_counter() - start_time
                 print(f"[{elapsed:6.2f}s] {event.text!r}")
@@ -1336,6 +1577,11 @@ def main():
     if final_state is not None:
         if final_state.error:
             logger.error("Run error: %s", final_state.error)
+        logger.info(
+            "Model: %s, Reasoning level: %s",
+            final_state.model_name,
+            final_state.reasoning_level,
+        )
         logger.info("Token Usage: %s", str(final_state.usage_metadata))
         for label, ctx in (
             ("Literature", final_state.literature_context),

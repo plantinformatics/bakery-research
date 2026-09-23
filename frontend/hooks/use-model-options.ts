@@ -16,7 +16,7 @@ export type ModelOptions = {
  * `Query.py`'s `AVAILABLE_MODELS`/`AVAILABLE_REASONING_LEVELS` defaults.
  */
 const FALLBACK_OPTIONS: ModelOptions = {
-  models: ["gemini-3.8-flash", "gemini-2.5-flash"],
+  models: ["gemini-3.8-flash", "gemini-2.5-flash", "gpt-5.6-luna", "gpt-5.6-sol"],
   defaultModel: "gemini-3.8-flash",
   reasoningLevels: ["minimal", "low", "medium", "high"],
   defaultReasoningLevel: "medium",

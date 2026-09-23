@@ -23,6 +23,7 @@ import {
   ToolGroupTrigger,
 } from "@/components/assistant-ui/elements/tool-group.aui";
 import { TooltipIconButton } from "@/components/assistant-ui/elements/tooltip-icon-button";
+import { ModelSelector } from "@/components/model-selector";
 import { Button } from "@/components/ui/button";
 import { Skeleton } from "@/components/ui/skeleton";
 import { cn } from "@/lib/utils";
@@ -293,11 +294,14 @@ const Composer: FC<{ autoFocus: boolean }> = ({ autoFocus }) => {
 
 const ComposerAction: FC = () => {
   return (
-    <div className="aui-composer-action-wrapper relative flex items-center justify-between">
-      <AuiIf condition={(s) => s.thread.capabilities.attachments}>
-        <ComposerAddAttachment />
-      </AuiIf>
-      <div className="flex items-center gap-1.5">
+    <div className="aui-composer-action-wrapper relative flex items-center justify-between gap-2">
+      <div className="flex min-w-0 items-center gap-1">
+        <AuiIf condition={(s) => s.thread.capabilities.attachments}>
+          <ComposerAddAttachment />
+        </AuiIf>
+        <ModelSelector />
+      </div>
+      <div className="flex shrink-0 items-center gap-1.5">
         <AuiIf condition={(s) => s.thread.capabilities.dictation}>
           <AuiIf condition={(s) => s.composer.dictation == null}>
             <ComposerPrimitive.Dictate asChild>
