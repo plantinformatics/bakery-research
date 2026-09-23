@@ -24,7 +24,7 @@ import numpy as np
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dotenv import load_dotenv
 
-import prompts
+from getPrompt import getPrompt
 
 load_dotenv(Path(__file__).resolve().parents[1] / ".env")
 
@@ -288,8 +288,8 @@ class RunState(BaseModel):
     accessions: List[str] = Field(default_factory=list)
     usage_metadata: dict = Field(default_factory=dict)
     # Raw context strings retrieved from Neo4j and injected into the
-    # answer-generation prompt by `prompts.build_answer_prompt` (see there
-    # for the exact `### [Source: ...]` framing each is wrapped in). Exposed here so
+    # answer-generation prompt by `_build_answer_prompt` (see there for the
+    # exact `### [Source: ...]` framing each is wrapped in). Exposed here so
     # callers (e.g. the frontend's pipeline status panel) can inspect exactly
     # what was retrieved, independent of the final cited answer text.
     literature_context: Optional[str] = None
@@ -330,6 +330,7 @@ class ErrorEvent:
 
 RunEvent = Union[StageChangeEvent, TextEvent, ReasoningEvent, ResultEvent, ErrorEvent]
 
+global_instruction_and_information = getPrompt('global_instruction_and_information');
 
 class PlantBioRAG:
     def __init__(self):
@@ -692,7 +693,11 @@ class PlantBioRAG:
     def expand_question_and_queries(
         self, q: str
     ) -> tuple[str, list[str], bool, bool, list[str], str, str]:
-        prompt = prompts.build_expand_question_prompt(q)
+        prompt = getPrompt("expand_question_and_queries") + f"""
+        @@@@
+        {q}
+        @@@@
+        """
         resp = self._llm_invoke(prompt)
         clean_json = resp.replace("```json", "").replace("```", "").strip()
         data = json.loads(clean_json)
@@ -743,11 +748,11 @@ class PlantBioRAG:
         self, question: str, answer: str, species: str
     ) -> List[str]:
         """Extract only relevant accessions in one LLM call."""
-        payload = json.dumps(
-            {"question": question, "answer": answer, "species": species},
-            ensure_ascii=False,
-        )
-        prompt = prompts.build_extract_accessions_prompt(payload)
+        payload = json.dumps({"question": question, "answer": answer, "species": species},
+                             ensure_ascii=False)
+        prompt = getPrompt("extract_accessions") + """
+Input JSON:
+""" + payload
         raw = self._llm_invoke(prompt).strip()
         raw = re.sub(r"^```(?:json)?\s*", "", raw)
         raw = re.sub(r"\s*```$", "", raw)
@@ -834,9 +839,14 @@ class PlantBioRAG:
     def _present_accession_results(
         self, original_question: str, api_response: dict
     ) -> str:
-        prompt = prompts.build_present_accession_results_prompt(
-            original_question, api_response
-        )
+        prompt = getPrompt("present_accession_results") + f"""
+
+
+        A user asked: "{original_question}". 
+
+        The AGG accession API returned the following results:
+        {api_response}
+        """
         resp = self._llm_invoke(prompt)
         return resp
 
@@ -1144,6 +1154,65 @@ class PlantBioRAG:
             pretzel_context = pretzel_future.result() if pretzel_future else ""
         return literature_context, metadata_context, pretzel_context
 
+    # Pure string assembly - no I/O, so nothing to catch here.
+    def _build_answer_prompt(
+        self,
+        expanded_question: str,
+        q: str,
+        literature_context: str,
+        metadata_context: str,
+        pretzel_context: str,
+    ) -> str:
+        prompt = (
+            global_instruction_and_information
+            + getPrompt("build_answer_prompt") + f"""
+        """
+        )
+        if literature_context:
+            prompt += literature_context
+        if metadata_context:
+            prompt += f"""\n\n\n
+        ### [Source: Metadata Graph]:
+        {metadata_context}"""
+        if pretzel_context:
+            prompt += f"""\n\n\n
+        ### [Source: Pretzel Documentation]:
+        {pretzel_context}"""
+        prompt += f"""
+
+
+
+            Analysis of user question: 
+            {expanded_question}
+
+            User Question:
+            @@@@
+            {q}
+            @@@@
+            Answer:"""
+        return prompt
+
+    # Prompt used on a semantic-cache hit: instead of re-running retrieval,
+    # ask the LLM to answer the new question using only the cached answer
+    # to a very similar prior question as context.
+    def _build_cached_answer_prompt(self, q: str, cached_answer: str) -> str:
+        return (
+            global_instruction_and_information
+            + getPrompt("build_cached_answer_prompt") + f"""
+
+            User Question:
+            @@@@
+            {q}
+            @@@@
+
+            Previous answer to a similar question: 
+            ####
+            {cached_answer}
+            ####
+
+            Answer:"""
+        )
+
     # Returns (building and caching, if necessary) the answer-generation
     # client for one (model_name, reasoning_level) combo. Called with
     # already-validated values from `_resolve_model_name`/
@@ -1348,7 +1417,7 @@ class PlantBioRAG:
                 )
                 yield StageChangeEvent(state=state)
 
-                prompt = prompts.build_cached_answer_prompt(q, cached_answer)
+                prompt = self._build_cached_answer_prompt(q, cached_answer)
 
                 start_time = time.perf_counter()
                 answer_parts = []
@@ -1462,7 +1531,7 @@ class PlantBioRAG:
                 }
             )
 
-            prompt = prompts.build_answer_prompt(
+            prompt = self._build_answer_prompt(
                 expanded_question,
                 q,
                 literature_context,
