@@ -1,6 +1,6 @@
 "use client";
 
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { CheckIcon, CopyIcon } from "lucide-react";
 import { useAuiState } from "@assistant-ui/react";
 import { useAgUiState } from "@assistant-ui/react-ag-ui";
@@ -13,6 +13,7 @@ import {
   CollapsibleTrigger,
 } from "@/components/ui/collapsible";
 import {
+  formatTokenUsage,
   PIPELINE_STAGES,
   stageLabel,
   type PipelineStage,
@@ -89,6 +90,12 @@ export function PipelineStatus() {
   const isRunning = useAuiState((s) => s.thread.isRunning);
   const current = stageIndex(state?.stage);
   const accessions = state?.accessions ?? [];
+  const usageLabel = formatTokenUsage(state?.usage_metadata);
+
+  useEffect(() => {
+    if (!usageLabel || !state?.usage_metadata) return;
+    console.info("Token usage:", usageLabel, state.usage_metadata);
+  }, [usageLabel, state?.usage_metadata]);
 
   if (!isRunning && !state?.stage) {
     return null;
@@ -149,6 +156,10 @@ export function PipelineStatus() {
             );
           })}
         </ol>
+
+        {usageLabel ? (
+          <p className="text-muted-foreground text-xs">Tokens: {usageLabel}</p>
+        ) : null}
 
         {state?.expanded_question ? (
           <p className="text-muted-foreground text-xs">

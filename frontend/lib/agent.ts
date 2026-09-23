@@ -4,9 +4,9 @@ export const AGUI_AGENT_URL =
 
 /**
  * Model/reasoning-level selector options (`GraphRAG/main.py` →
- * `GET /options`), kept in sync with `GraphRAG/Query.py`'s
- * `AVAILABLE_MODELS`/`AVAILABLE_REASONING_LEVELS`. Defaults to the `/agent`
- * origin with `/options` swapped in, so only one env var is usually needed.
+ * `GET /options`), loaded from `frontend/config/models.json`. Defaults to the
+ * `/agent` origin with `/options` swapped in, so only one env var is
+ * usually needed.
  */
 export const AGUI_OPTIONS_URL =
   process.env.NEXT_PUBLIC_AGUI_OPTIONS_URL ??

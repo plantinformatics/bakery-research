@@ -73,58 +73,108 @@ logging.getLogger("neo4j.notifications").setLevel(
 )  # comment out in future if fixed upstream
 logger = logging.getLogger(__name__)
 
-GEMINI_MODEL = "gemini-3.8-flash"
-# GPT models selectable alongside the Gemini models below. Routed through
-# `ChatOpenAI` (OpenAI's Responses API) instead of `ChatGoogleGenerativeAI`
-# - see `_model_provider`/`_get_answer_llm`.
-GPT_MODEL = "gpt-5.6-luna"
-GPT_SOL_MODEL = "gpt-5.6-sol"
 GEMINI_EMBEDDING_MODEL = "models/gemini-embedding-001"
-# How hard the model reasons before producing the final answer (Gemini 3+
-# models only; replaces the older token-based `thinking_budget`).
-# One of "minimal", "low", "medium", "high" - higher levels reason more
-# deeply at the cost of latency/tokens. Unset defaults to "high".
-ANSWER_THINKING_LEVEL = "medium"
 
-# Answer-generation models selectable from the frontend's model selector
-# (see `frontend/components/model-selector.tsx`), and the thinking/reasoning
-# levels selectable from its reasoning selector. `GraphRAG/main.py` exposes
-# these via `GET /options` so the frontend has a single source of truth to
-# populate the two dropdowns from. `PlantBioRAG.query()` falls back to the
-# first/`ANSWER_THINKING_LEVEL` defaults only when no selection was made at
-# all (e.g. an older frontend build); an explicit-but-unrecognised value
-# (a stale selection, a bad actor) fails the run instead of silently
-# substituting a different model than the one requested - see
+# Answer-generation models and reasoning levels selectable from the
+# frontend (`frontend/components/model-selector.tsx`). Edit
+# `frontend/config/models.json` — this module only loads and checks it.
+# `GraphRAG/main.py` exposes the same values via `GET /options`.
+# `PlantBioRAG.query()` falls back to `defaultModel` /
+# `defaultReasoningLevel` only when no selection was made at all (e.g. an
+# older frontend build); an explicit-but-unrecognised value fails the run
+# instead of silently substituting a different model - see
 # `_resolve_model_name`/`_resolve_reasoning_level`.
 #
-# Spans two providers: Gemini models go through `ChatGoogleGenerativeAI`,
-# `GPT_MODEL`/`GPT_SOL_MODEL` go through `ChatOpenAI` (see `_model_provider`).
-# Both providers happen to use the same "minimal"/"low"/"medium"/"high"
-# reasoning-effort vocabulary, so `AVAILABLE_REASONING_LEVELS` is shared
-# across all of `AVAILABLE_MODELS` without per-model overrides.
-AVAILABLE_MODELS = [GEMINI_MODEL, "gemini-2.5-flash", GPT_MODEL, GPT_SOL_MODEL]
-AVAILABLE_REASONING_LEVELS = ["minimal", "low", "medium", "high"]
+# Spans two providers: ids starting with "gpt-" go through `ChatOpenAI`,
+# everything else through `ChatGoogleGenerativeAI` (see `_model_provider`).
+# Both providers use the same reasoning-level vocabulary, so
+# `reasoningLevels` is shared across every model.
+#
+# `defaultModel` is also the fixed model for internal helper calls
+# (question expansion, accession extraction). Those calls always use
+# `ChatGoogleGenerativeAI`, so the default must be a Gemini id.
+# `thinkingBudgets` is the token budget for Gemini models that predate
+# `thinking_level` (e.g. gemini-2.5-flash, which rejects `thinking_level`
+# with an API 400). GPT models ignore it and take `reasoning_level`
+# directly as OpenAI's `reasoning_effort`.
+_MODEL_CONFIG_PATH = (
+    Path(__file__).resolve().parents[1] / "frontend" / "config" / "models.json"
+)
 
-# `thinking_budget` values (in tokens) used for the reasoning selector on
-# Gemini models that predate `thinking_level` (e.g. gemini-2.5-flash, which
-# rejects `thinking_level` outright with an API 400 - "Thinking level is
-# not supported for this model"). Kept in the same "minimal" -> "high"
-# vocabulary as `AVAILABLE_REASONING_LEVELS` so the selector behaves
-# consistently across model families, even though the underlying Gemini
-# API parameter differs. Not used for GPT models, which take
-# `reasoning_level` directly as OpenAI's `reasoning_effort`.
-REASONING_LEVEL_TO_THINKING_BUDGET = {
-    "minimal": 0,
-    "low": 1024,
-    "medium": 8192,
-    "high": 24576,
-}
+
+def _string_list(config: dict, key: str, path: Path) -> List[str]:
+    value = config.get(key)
+    if (
+        not isinstance(value, list)
+        or not value
+        or not all(isinstance(item, str) and item.strip() for item in value)
+    ):
+        raise RuntimeError(f"{path}: {key} must be a non-empty list of strings")
+    if len(value) != len(set(value)):
+        raise RuntimeError(f"{path}: {key} contains duplicates")
+    return value
+
+
+def _load_model_config(path: Path) -> dict:
+    try:
+        config = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError as e:
+        raise RuntimeError(f"Model config not found at {path}") from e
+    except json.JSONDecodeError as e:
+        raise RuntimeError(f"Model config at {path} is not valid JSON: {e}") from e
+    if not isinstance(config, dict):
+        raise RuntimeError(f"{path} must be a JSON object")
+
+    models = _string_list(config, "models", path)
+    reasoning_levels = _string_list(config, "reasoningLevels", path)
+    default_model = config.get("defaultModel")
+    default_reasoning = config.get("defaultReasoningLevel")
+    if default_model not in models:
+        raise RuntimeError(f"{path}: defaultModel {default_model!r} is not in models")
+    if not str(default_model).startswith("gemini-"):
+        raise RuntimeError(
+            f"{path}: defaultModel is also the internal helper model and must "
+            "be a Gemini model id"
+        )
+    if default_reasoning not in reasoning_levels:
+        raise RuntimeError(
+            f"{path}: defaultReasoningLevel {default_reasoning!r} is not in "
+            "reasoningLevels"
+        )
+
+    budgets = config.get("thinkingBudgets")
+    if not isinstance(budgets, dict):
+        raise RuntimeError(f"{path}: thinkingBudgets must be an object")
+    parsed_budgets: Dict[str, int] = {}
+    for level in reasoning_levels:
+        budget = budgets.get(level)
+        if isinstance(budget, bool) or not isinstance(budget, int) or budget < 0:
+            raise RuntimeError(
+                f"{path}: thinkingBudgets.{level} must be a non-negative integer"
+            )
+        parsed_budgets[level] = budget
+
+    return {
+        "models": models,
+        "defaultModel": default_model,
+        "reasoningLevels": reasoning_levels,
+        "defaultReasoningLevel": default_reasoning,
+        "thinkingBudgets": parsed_budgets,
+    }
+
+
+_MODEL_CONFIG = _load_model_config(_MODEL_CONFIG_PATH)
+GEMINI_MODEL = _MODEL_CONFIG["defaultModel"]
+AVAILABLE_MODELS = _MODEL_CONFIG["models"]
+AVAILABLE_REASONING_LEVELS = _MODEL_CONFIG["reasoningLevels"]
+ANSWER_THINKING_LEVEL = _MODEL_CONFIG["defaultReasoningLevel"]
+REASONING_LEVEL_TO_THINKING_BUDGET = _MODEL_CONFIG["thinkingBudgets"]
 
 
 def _model_provider(model_name: str) -> str:
     """"openai" for GPT models (routed through `ChatOpenAI`/the Responses
     API), "google" for everything else (Gemini, via
-    `ChatGoogleGenerativeAI`). Add new GPT models to `AVAILABLE_MODELS`
+    `ChatGoogleGenerativeAI`). Add new GPT models to `frontend/config/models.json`
     freely - anything named "gpt-*" is picked up automatically."""
     return "openai" if model_name.startswith("gpt-") else "google"
 
@@ -1321,6 +1371,7 @@ class PlantBioRAG:
                 )
 
                 usage_metadata = getattr(full_chunk, "usage_metadata", {}) or {}
+                logger.info("Token usage: %s", usage_metadata)
                 state = state.model_copy(update={"usage_metadata": usage_metadata})
                 yield ResultEvent(state=state)
                 return
@@ -1441,6 +1492,7 @@ class PlantBioRAG:
 
             answer = "".join(answer_parts).strip()
             usage_metadata = getattr(full_chunk, "usage_metadata", {}) or {}
+            logger.info("Token usage: %s", usage_metadata)
             state = state.model_copy(update={"usage_metadata": usage_metadata})
             full_answer = answer
 
@@ -1582,7 +1634,6 @@ def main():
             final_state.model_name,
             final_state.reasoning_level,
         )
-        logger.info("Token Usage: %s", str(final_state.usage_metadata))
         for label, ctx in (
             ("Literature", final_state.literature_context),
             ("Metadata Graph", final_state.metadata_context),

@@ -1,0 +1,17 @@
+{
+  "models": [
+    "gemini-3.8-flash",
+    "gemini-2.5-flash",
+    "gpt-6-luna",
+    "gpt-6-sol"
+  ],
+  "defaultModel": "gemini-3.8-flash",
+  "reasoningLevels": ["minimal", "low", "medium", "high"],
+  "defaultReasoningLevel": "medium",
+  "thinkingBudgets": {
+    "minimal": 0,
+    "low": 1024,
+    "medium": 8192,
+    "high": 24576
+  }
+}

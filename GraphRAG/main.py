@@ -193,8 +193,8 @@ async def run_agent(input: RunAgentInput) -> StreamingResponse:
 async def get_options() -> dict:
     """Model/reasoning choices for the frontend's selectors
     (`frontend/components/model-selector.tsx`), kept in sync with what
-    `PlantBioRAG.query()` actually accepts (`Query.py`'s `AVAILABLE_MODELS`/
-    `AVAILABLE_REASONING_LEVELS`)."""
+    `PlantBioRAG.query()` actually accepts (`frontend/config/models.json`,
+    loaded by `Query.py`)."""
     return {
         "models": AVAILABLE_MODELS,
         "defaultModel": GEMINI_MODEL,

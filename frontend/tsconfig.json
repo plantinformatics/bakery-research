@@ -31,6 +31,7 @@
   "include": [
     "**/*.ts",
     "**/*.tsx",
+    "config/models.json",
     ".next/types/**/*.ts",
     ".next/dev/types/**/*.ts"
   ],

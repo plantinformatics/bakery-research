@@ -43,7 +43,7 @@ export function ModelSelector() {
   }, [reasoningLevels, defaultReasoningLevel]);
 
   // Every model currently accepts the same reasoning vocabulary
-  // (`AVAILABLE_REASONING_LEVELS` in `Query.py`), so build one custom
+  // (`reasoningLevels` in `frontend/config/models.json`), so build one custom
   // effort list and share it across all model options.
   const efforts = useMemo(
     () =>

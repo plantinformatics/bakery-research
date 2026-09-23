@@ -1,6 +1,7 @@
 "use client";
 
 import { useEffect, useState } from "react";
+import modelConfig from "@/config/models.json";
 import { AGUI_OPTIONS_URL } from "@/lib/agent";
 
 export type ModelOptions = {
@@ -12,14 +13,14 @@ export type ModelOptions = {
 
 /**
  * Static fallback used until `GET /options` (`GraphRAG/main.py`) resolves,
- * or if the request fails (e.g. backend not running yet). Kept in sync with
- * `Query.py`'s `AVAILABLE_MODELS`/`AVAILABLE_REASONING_LEVELS` defaults.
+ * or if the request fails (e.g. backend not running yet). Read from the
+ * same `frontend/config/models.json` the backend loads.
  */
 const FALLBACK_OPTIONS: ModelOptions = {
-  models: ["gemini-3.8-flash", "gemini-2.5-flash", "gpt-5.6-luna", "gpt-5.6-sol"],
-  defaultModel: "gemini-3.8-flash",
-  reasoningLevels: ["minimal", "low", "medium", "high"],
-  defaultReasoningLevel: "medium",
+  models: modelConfig.models,
+  defaultModel: modelConfig.defaultModel,
+  reasoningLevels: modelConfig.reasoningLevels,
+  defaultReasoningLevel: modelConfig.defaultReasoningLevel,
 };
 
 /** Fetches the selectable models/reasoning levels for `ModelSelector` from
