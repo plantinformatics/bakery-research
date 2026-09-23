@@ -8,6 +8,7 @@ import {
 } from "@assistant-ui/react";
 import { Thread } from "@/components/assistant-ui/elements/thread.aui";
 import { PipelineStatus } from "@/components/pipeline-status";
+import { ModelSelector } from "@/components/model-selector";
 import { PlusIcon } from "lucide-react";
 import type { FC } from "react";
 
@@ -74,6 +75,7 @@ export default function Home() {
     <main className="relative flex h-dvh flex-col">
       <PipelineStatus />
       <div className="relative min-h-0 flex-1">
+        <ModelSelector />
         <NewThreadButton />
         <ThreadWithSuggestions />
       </div>

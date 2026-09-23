@@ -13,6 +13,11 @@ export type PipelineStage = (typeof PIPELINE_STAGES)[number];
 export type PlantBioRunState = {
   stage?: PipelineStage | string;
   expanded_question?: string | null;
+  /** Answer-generation model/reasoning level actually used for this run
+   * (after `Query.py`'s fallback resolution), echoed back so the frontend
+   * can confirm the `ModelSelector` choice took effect. */
+  model_name?: string;
+  reasoning_level?: string;
   species?: string;
   is_agg_accession_query?: boolean;
   needs_clarification?: boolean;

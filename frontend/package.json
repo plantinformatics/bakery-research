@@ -14,6 +14,7 @@
     "@assistant-ui/react-ag-ui": "latest",
     "@assistant-ui/react-markdown": "latest",
     "class-variance-authority": "^0.7.1",
+    "cmdk": "^1.1.1",
     "cn": "^0.2.4",
     "lucide-react": "^1.38.0",
     "next": "^16.3.4",
