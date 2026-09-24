@@ -98,11 +98,32 @@ This starts `POST /agent`, which accepts an AG-UI `RunAgentInput` payload and st
 
 ## Data directories
 
+### `BuildLiteraturePretzelDocuementationGraph.py`
+
 - `md_dir/` — source Markdown documents used for the initial literature graph `build` (e.g. `Abbott 1991.pdf.md`, `Coulter 2018.pdf.md`, `Wang 2020.pdf.md`).
 - `add_dir/` — new documents to incrementally `add`/`add_sup` to the literature graph.
 - `add_pretzel_functions/` — Pretzel documentation chunks used by `add_pretzel`.
 
 Any of these can be overridden per-run with `--dir`/`--file` (see above).
+
+### `Query.py` and `main.py`
+
+`PlantBioRAG` defined in `Query.py` and imported by `main.py` uses `./prompts` by default, and it will read `$promptsDir` for an alternate location of this directory.
+This enables the prompts to be customised.  The prompts directory will contain these files :
+```
+global_instruction_and_information
+expand_question_and_queries
+extract_accessions
+present_accession_results
+build_answer_prompt
+build_cached_answer_prompt
+```
+
+For example, to use the example prompts directory `bakery-research/prompts/` included in this repository :
+```bash
+cd bakery-research/GraphRAG && promptsDir=../prompts uv run uvicorn main:app --reload --port 8000 &
+```
+
 
 ## Logs
 
