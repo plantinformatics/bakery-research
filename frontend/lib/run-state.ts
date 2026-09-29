@@ -18,6 +18,9 @@ export type PlantBioRunState = {
    * can confirm the `ModelSelector` choice took effect. */
   model_name?: string;
   reasoning_level?: string;
+  /** Literature context character budget actually used for this run,
+   * echoed back so the frontend can confirm the slider choice took effect. */
+  max_context_chars?: number;
   species?: string;
   is_agg_accession_query?: boolean;
   needs_clarification?: boolean;

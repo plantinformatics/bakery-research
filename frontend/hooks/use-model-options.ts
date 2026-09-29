@@ -9,6 +9,13 @@ export type ModelOptions = {
   defaultModel: string;
   reasoningLevels: string[];
   defaultReasoningLevel: string;
+  /** Literature context budget slider bounds (`Query.py`'s
+   * `MIN_/MAX_LITERATURE_CONTEXT_CHARS`, `LITERATURE_CONTEXT_CHARS_STEP`,
+   * `MAX_CHARACTERS`). */
+  minLiteratureContextChars: number;
+  maxLiteratureContextChars: number;
+  literatureContextCharsStep: number;
+  defaultLiteratureContextChars: number;
 };
 
 /**
@@ -21,6 +28,11 @@ const FALLBACK_OPTIONS: ModelOptions = {
   defaultModel: modelConfig.defaultModel,
   reasoningLevels: modelConfig.reasoningLevels,
   defaultReasoningLevel: modelConfig.defaultReasoningLevel,
+  // Keep in sync with the literature context constants in `GraphRAG/Query.py`.
+  minLiteratureContextChars: 10000,
+  maxLiteratureContextChars: 100000,
+  literatureContextCharsStep: 10000,
+  defaultLiteratureContextChars: 50000,
 };
 
 /** Fetches the selectable models/reasoning levels for `ModelSelector` from
@@ -45,6 +57,15 @@ export function useModelOptions(): ModelOptions {
             : prev.reasoningLevels,
           defaultReasoningLevel:
             data.defaultReasoningLevel ?? prev.defaultReasoningLevel,
+          minLiteratureContextChars:
+            data.minLiteratureContextChars ?? prev.minLiteratureContextChars,
+          maxLiteratureContextChars:
+            data.maxLiteratureContextChars ?? prev.maxLiteratureContextChars,
+          literatureContextCharsStep:
+            data.literatureContextCharsStep ?? prev.literatureContextCharsStep,
+          defaultLiteratureContextChars:
+            data.defaultLiteratureContextChars ??
+            prev.defaultLiteratureContextChars,
         }));
       })
       .catch((err: unknown) => {
