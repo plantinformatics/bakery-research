@@ -173,7 +173,7 @@ REASONING_LEVEL_TO_THINKING_BUDGET = _MODEL_CONFIG["thinkingBudgets"]
 
 
 def _model_provider(model_name: str) -> str:
-    """"openai" for GPT models (routed through `ChatOpenAI`/the Responses
+    """ "openai" for GPT models (routed through `ChatOpenAI`/the Responses
     API), "google" for everything else (Gemini, via
     `ChatGoogleGenerativeAI`). Add new GPT models to `frontend/config/models.json`
     freely - anything named "gpt-*" is picked up automatically."""
@@ -250,11 +250,17 @@ RRF_RANK_CONSTANT = 60  # Standard reciprocal-rank denominator offset.
 # Metadata retrieval: elbow cutoff, neighbor expansion, then context limits.
 METADATA_RRF_MIN_SEEDS = 5  # Minimum retained before a score-drop cutoff is allowed.
 METADATA_RRF_SCAN_LIMIT = 80  # Ranked candidates inspected to find an elbow.
-METADATA_RRF_MIN_RELATIVE_DROP = 0.35  # Minimum fractional drop between adjacent scores.
-METADATA_RRF_MIN_ABSOLUTE_DROP = 0.005  # Minimum absolute drop as well as relative drop.
+METADATA_RRF_MIN_RELATIVE_DROP = (
+    0.35  # Minimum fractional drop between adjacent scores.
+)
+METADATA_RRF_MIN_ABSOLUTE_DROP = (
+    0.005  # Minimum absolute drop as well as relative drop.
+)
 METADATA_MAX_RESULTS_AFTER_RRF = 40  # Hard cap after applying the elbow cutoff.
 METADATA_NEIGHBORS_PER_SEED = 2  # Maximum adjacent metadata nodes per selected seed.
-METADATA_MAX_TRIPLES = 50  # Maximum relationship descriptions included in metadata context.
+METADATA_MAX_TRIPLES = (
+    50  # Maximum relationship descriptions included in metadata context.
+)
 METADATA_MAX_CONTEXT_CHARS = 20000  # Character budget for metadata context.
 
 # Literature/Pretzel retrieval defaults; vector and full-text limits are per query.
@@ -270,7 +276,7 @@ ACCESSION_API_URL = os.getenv("ACCESSION_API_URL") or ""
 ACCESSION_API_TOKEN = "research_accessions"
 ACCESSION_API_TIMEOUT = 120
 
-METADATA_MAX_CHARACTERS = 20000  
+METADATA_MAX_CHARACTERS = 50000
 
 SEMANTIC_CACHE_INDEX = "semantic_cache_vector"
 SEMANTIC_CACHE_THRESHOLD = 0.92
@@ -351,7 +357,8 @@ class ErrorEvent:
 
 RunEvent = Union[StageChangeEvent, TextEvent, ReasoningEvent, ResultEvent, ErrorEvent]
 
-global_instruction_and_information = getPrompt('global_instruction_and_information');
+global_instruction_and_information = getPrompt("global_instruction_and_information")
+
 
 class PlantBioRAG:
     def __init__(self):
@@ -447,7 +454,11 @@ class PlantBioRAG:
 
     # Run vector + full-text retrieval concurrently
     def _hybrid_scores_concurrent(
-        self, q: str, vector_fn, fulltext_fn, k: int,
+        self,
+        q: str,
+        vector_fn,
+        fulltext_fn,
+        k: int,
         rrf_k: int = RRF_RANK_CONSTANT,
     ) -> Dict[str, float]:
         with ThreadPoolExecutor(max_workers=2) as executor:
@@ -459,7 +470,11 @@ class PlantBioRAG:
 
     # Run expanded-query searches concurrently
     def _multi_query_hybrid_scores_concurrent(
-        self, expanded_queries: list[str], vector_fn, fulltext_fn, k: int,
+        self,
+        expanded_queries: list[str],
+        vector_fn,
+        fulltext_fn,
+        k: int,
         rrf_k: int = RRF_RANK_CONSTANT,
     ) -> Dict[str, float]:
         all_fused: Dict[str, float] = {}
@@ -468,7 +483,11 @@ class PlantBioRAG:
         ) as executor:
             future_to_query = {
                 executor.submit(
-                    self._hybrid_scores_concurrent, eq, vector_fn, fulltext_fn, k,
+                    self._hybrid_scores_concurrent,
+                    eq,
+                    vector_fn,
+                    fulltext_fn,
+                    k,
                     rrf_k,
                 ): eq
                 for eq in expanded_queries
@@ -578,7 +597,9 @@ class PlantBioRAG:
 
     # Use Reciprocal Rank Fusion (RRF) instead of min-max normalized weights
     def _rrf_fusion(
-        self, vector_scores: Dict[str, float], ft_scores: Dict[str, float],
+        self,
+        vector_scores: Dict[str, float],
+        ft_scores: Dict[str, float],
         k_penalty=RRF_RANK_CONSTANT,
     ) -> Dict[str, float]:
         rrf_scores = {}
@@ -718,11 +739,14 @@ class PlantBioRAG:
     def expand_question_and_queries(
         self, q: str
     ) -> tuple[str, list[str], bool, bool, list[str], str, str]:
-        prompt = getPrompt("expand_question_and_queries") + f"""
+        prompt = (
+            getPrompt("expand_question_and_queries")
+            + f"""
         @@@@
         {q}
         @@@@
         """
+        )
         resp = self._llm_invoke(prompt)
         clean_json = resp.replace("```json", "").replace("```", "").strip()
         data = json.loads(clean_json)
@@ -773,11 +797,17 @@ class PlantBioRAG:
         self, question: str, answer: str, species: str
     ) -> List[str]:
         """Extract only relevant accessions in one LLM call."""
-        payload = json.dumps({"question": question, "answer": answer, "species": species},
-                             ensure_ascii=False)
-        prompt = getPrompt("extract_accessions") + """
+        payload = json.dumps(
+            {"question": question, "answer": answer, "species": species},
+            ensure_ascii=False,
+        )
+        prompt = (
+            getPrompt("extract_accessions")
+            + """
 Input JSON:
-""" + payload
+"""
+            + payload
+        )
         raw = self._llm_invoke(prompt).strip()
         raw = re.sub(r"^```(?:json)?\s*", "", raw)
         raw = re.sub(r"\s*```$", "", raw)
@@ -864,7 +894,9 @@ Input JSON:
     def _present_accession_results(
         self, original_question: str, api_response: dict
     ) -> str:
-        prompt = getPrompt("present_accession_results") + f"""
+        prompt = (
+            getPrompt("present_accession_results")
+            + f"""
 
 
         A user asked: "{original_question}". 
@@ -872,6 +904,7 @@ Input JSON:
         The AGG accession API returned the following results:
         {api_response}
         """
+        )
         resp = self._llm_invoke(prompt)
         return resp
 
@@ -908,7 +941,9 @@ Input JSON:
         return dict(filtered[:k])
 
     def _vector_chunks_metadata(
-        self, q: str, k: int = METADATA_VECTOR_K,
+        self,
+        q: str,
+        k: int = METADATA_VECTOR_K,
         taxon_filter: Optional[dict[str, Any]] = None,
     ) -> Dict[str, float]:
         # Vector search in metadata_graph via metadata_vector_index using Gemini embeddings.
@@ -924,7 +959,9 @@ Input JSON:
         return self._filter_metadata_scores(scores, k, taxon_filter)
 
     def _fulltext_chunks_metadata(
-        self, q: str, k: int = METADATA_FULLTEXT_K,
+        self,
+        q: str,
+        k: int = METADATA_FULLTEXT_K,
         taxon_filter: Optional[dict[str, Any]] = None,
     ) -> Dict[str, float]:
         # Fulltext search in metadata_graph via metadata_fulltext_index.
@@ -1003,7 +1040,9 @@ Input JSON:
         return seedchunks, expandedchunks, triples
 
     def _search_metadata_hybrid(
-        self, expanded_queries: list[str], max_chars: int = METADATA_MAX_CONTEXT_CHARS,
+        self,
+        expanded_queries: list[str],
+        max_chars: int = METADATA_MAX_CONTEXT_CHARS,
         taxon_filter: Optional[dict[str, Any]] = None,
     ) -> str:
         # Hybrid search for metadata_graph.
@@ -1016,8 +1055,11 @@ Input JSON:
             query, METADATA_FULLTEXT_K, taxon_filter
         )
         all_fused = self._multi_query_hybrid_scores_concurrent(
-            expanded_queries, vector_fn, fulltext_fn,
-            max(METADATA_VECTOR_K, METADATA_FULLTEXT_K), RRF_RANK_CONSTANT,
+            expanded_queries,
+            vector_fn,
+            fulltext_fn,
+            max(METADATA_VECTOR_K, METADATA_FULLTEXT_K),
+            RRF_RANK_CONSTANT,
         )
         ranked = sorted(all_fused.items(), key=lambda item: item[1], reverse=True)
         # Search deeper than the final result cap so an elbow below the first
@@ -1083,7 +1125,9 @@ Input JSON:
         return "\n".join(context_parts)
 
     def _get_metadata_context(
-        self, query: str, expanded_queries: list[str],
+        self,
+        query: str,
+        expanded_queries: list[str],
         taxon_filter: Optional[dict[str, Any]] = None,
     ) -> str:
         context_parts = []
@@ -1232,7 +1276,11 @@ Input JSON:
     # doesn't prevent literature context (or the whole answer) from coming
     # back. A failed source just contributes an empty string.
     def _retrieve_context(
-        self, q: str, expanded_queries: List[str], k: int, max_context_chars: int,
+        self,
+        q: str,
+        expanded_queries: List[str],
+        k: int,
+        max_context_chars: int,
         taxon_filter: Optional[dict[str, Any]] = None,
     ) -> Tuple[str, str, str]:
         def safe_call(fn, label, *args):
@@ -1252,8 +1300,12 @@ Input JSON:
                 max_context_chars,
             )
             metadata_future = executor.submit(
-                safe_call, self._get_metadata_context, "Metadata", q,
-                expanded_queries, taxon_filter
+                safe_call,
+                self._get_metadata_context,
+                "Metadata",
+                q,
+                expanded_queries,
+                taxon_filter,
             )
             pretzel_future = None
             if "pretzel" in q.lower():
@@ -1276,7 +1328,8 @@ Input JSON:
     ) -> str:
         prompt = (
             global_instruction_and_information
-            + getPrompt("build_answer_prompt") + f"""
+            + getPrompt("build_answer_prompt")
+            + f"""
         """
         )
         if literature_context:
@@ -1309,7 +1362,8 @@ Input JSON:
     def _build_cached_answer_prompt(self, q: str, cached_answer: str) -> str:
         return (
             global_instruction_and_information
-            + getPrompt("build_cached_answer_prompt") + f"""
+            + getPrompt("build_cached_answer_prompt")
+            + f"""
 
             User Question:
             @@@@
@@ -1630,8 +1684,12 @@ Input JSON:
                 )
             literature_context, metadata_context, pretzel_context = (
                 await asyncio.to_thread(
-                    self._retrieve_context, q, expanded_queries, k,
-                    max_context_chars, taxon_filter
+                    self._retrieve_context,
+                    q,
+                    expanded_queries,
+                    k,
+                    max_context_chars,
+                    taxon_filter,
                 )
             )
             end_time = time.perf_counter()

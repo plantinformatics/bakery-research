@@ -5,6 +5,9 @@ Example::
     from getPrompt import getPrompt
 
     prompt = getPrompt("answer.txt") + f"\n\nQuestion: {question}"
+
+Note that when changing prompts,
+uvicorn needs to be loaded because the hot reload doesn't extend to the prompts
 """
 
 import os
