@@ -25,6 +25,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from dotenv import load_dotenv
 
 from getPrompt import getPrompt
+from taxon_filter import metadata_matches_taxon, resolve_taxon_filter, taxon_regex
 
 load_dotenv(Path(__file__).resolve().parents[1] / ".env")
 
@@ -236,12 +237,32 @@ def _resolve_reasoning_level(reasoning_level: Optional[str]) -> str:
     )
 
 
-MAX_CHARACTERS = 600000
-MAX_TRIPLES = 50
+# CONTEXT OPTIMISATION
+# Metadata retrieval: filter taxon, then fetch vector/full-text candidates.
+SPECIES_FILTER_ENABLED = True
+METADATA_FILTER_OVERFETCH_MULTIPLIER = 5  # Extra candidates before species filtering.
+METADATA_VECTOR_K = 40  # Matching vector candidates retained per expanded query.
+METADATA_FULLTEXT_K = 40  # Matching full-text candidates retained per expanded query.
+
+# Shared ranking: RRF is used by literature, metadata, and Pretzel retrieval.
+RRF_RANK_CONSTANT = 60  # Standard reciprocal-rank denominator offset.
+
+# Metadata retrieval: elbow cutoff, neighbor expansion, then context limits.
+METADATA_RRF_MIN_SEEDS = 5  # Minimum retained before a score-drop cutoff is allowed.
+METADATA_RRF_SCAN_LIMIT = 80  # Ranked candidates inspected to find an elbow.
+METADATA_RRF_MIN_RELATIVE_DROP = 0.35  # Minimum fractional drop between adjacent scores.
+METADATA_RRF_MIN_ABSOLUTE_DROP = 0.005  # Minimum absolute drop as well as relative drop.
+METADATA_MAX_RESULTS_AFTER_RRF = 40  # Hard cap after applying the elbow cutoff.
+METADATA_NEIGHBORS_PER_SEED = 2  # Maximum adjacent metadata nodes per selected seed.
+METADATA_MAX_TRIPLES = 50  # Maximum relationship descriptions included in metadata context.
+METADATA_MAX_CONTEXT_CHARS = 20000  # Character budget for metadata context.
+
+# Literature/Pretzel retrieval defaults; vector and full-text limits are per query.
 QUERY_VECTOR_MAX_CHUNKS = 40
 QUERY_FULL_TEXT_MAX_CHUNKS = 40
-QUERY_MAX_CHUNKS = 80
-MAX_METADATA_CHUNKS = 80
+QUERY_MAX_CHUNKS = 80  # Maximum RRF-ranked literature chunks per expanded query.
+MAX_CHARACTERS = 20000  # Literature context character budget.
+MAX_TRIPLES = 50
 RERANK_MAX_TEXT_CHARS = 2000
 
 # Accession API config
@@ -249,7 +270,7 @@ ACCESSION_API_URL = os.getenv("ACCESSION_API_URL") or ""
 ACCESSION_API_TOKEN = "research_accessions"
 ACCESSION_API_TIMEOUT = 120
 
-METADATA_MAX_CHARACTERS = 300000
+METADATA_MAX_CHARACTERS = 20000  
 
 SEMANTIC_CACHE_INDEX = "semantic_cache_vector"
 SEMANTIC_CACHE_THRESHOLD = 0.92
@@ -426,18 +447,20 @@ class PlantBioRAG:
 
     # Run vector + full-text retrieval concurrently
     def _hybrid_scores_concurrent(
-        self, q: str, vector_fn, fulltext_fn, k: int
+        self, q: str, vector_fn, fulltext_fn, k: int,
+        rrf_k: int = RRF_RANK_CONSTANT,
     ) -> Dict[str, float]:
         with ThreadPoolExecutor(max_workers=2) as executor:
             vector_future = executor.submit(vector_fn, q, k)
             fulltext_future = executor.submit(fulltext_fn, q, k)
             vector_scores = vector_future.result()
             fulltext_scores = fulltext_future.result()
-        return self._rrf_fusion(vector_scores, fulltext_scores)
+        return self._rrf_fusion(vector_scores, fulltext_scores, rrf_k)
 
     # Run expanded-query searches concurrently
     def _multi_query_hybrid_scores_concurrent(
-        self, expanded_queries: list[str], vector_fn, fulltext_fn, k: int
+        self, expanded_queries: list[str], vector_fn, fulltext_fn, k: int,
+        rrf_k: int = RRF_RANK_CONSTANT,
     ) -> Dict[str, float]:
         all_fused: Dict[str, float] = {}
         with ThreadPoolExecutor(
@@ -445,7 +468,8 @@ class PlantBioRAG:
         ) as executor:
             future_to_query = {
                 executor.submit(
-                    self._hybrid_scores_concurrent, eq, vector_fn, fulltext_fn, k
+                    self._hybrid_scores_concurrent, eq, vector_fn, fulltext_fn, k,
+                    rrf_k,
                 ): eq
                 for eq in expanded_queries
             }
@@ -554,7 +578,8 @@ class PlantBioRAG:
 
     # Use Reciprocal Rank Fusion (RRF) instead of min-max normalized weights
     def _rrf_fusion(
-        self, vector_scores: Dict[str, float], ft_scores: Dict[str, float], k_penalty=60
+        self, vector_scores: Dict[str, float], ft_scores: Dict[str, float],
+        k_penalty=RRF_RANK_CONSTANT,
     ) -> Dict[str, float]:
         rrf_scores = {}
         for rankings in [vector_scores, ft_scores]:
@@ -851,21 +876,56 @@ Input JSON:
         return resp
 
     # 2. Metadata Graph RAG
+    def _filter_metadata_scores(
+        self,
+        scores: Dict[str, float],
+        k: int,
+        taxon_filter: Optional[dict[str, Any]],
+    ) -> Dict[str, float]:
+        """Keep the highest-ranked matching metadata nodes, preserving order."""
+        ranked = sorted(scores.items(), key=lambda item: item[1], reverse=True)
+        if not taxon_filter:
+            return dict(ranked[:k])
+        candidate_ids = [nid for nid, _ in ranked]
+        rows = self.graph.query(
+            "UNWIND $nids AS nid MATCH (n:MetadataGraph) "
+            "WHERE elementId(n) = nid "
+            "RETURN nid, n.crop AS crop, n.species AS species",
+            params={"nids": candidate_ids},
+        )
+        properties_by_id = {
+            row["nid"]: {"crop": row.get("crop"), "species": row.get("species")}
+            for row in rows
+        }
+        filtered = [
+            (nid, score)
+            for nid, score in ranked
+            if nid in properties_by_id
+            and metadata_matches_taxon(
+                properties_by_id[nid], taxon_filter, allow_unclassified=True
+            )
+        ]
+        return dict(filtered[:k])
+
     def _vector_chunks_metadata(
-        self, q: str, k: int = QUERY_VECTOR_MAX_CHUNKS
+        self, q: str, k: int = METADATA_VECTOR_K,
+        taxon_filter: Optional[dict[str, Any]] = None,
     ) -> Dict[str, float]:
         # Vector search in metadata_graph via metadata_vector_index using Gemini embeddings.
         q_emb = self.emb.embed_query(q)
+        search_k = k * METADATA_FILTER_OVERFETCH_MULTIPLIER if taxon_filter else k
         res = self.graph.query(
             "CYPHER 25 MATCH (n:MetadataGraph) "
             "SEARCH n IN (VECTOR INDEX metadata_vector_index FOR $emb LIMIT $k) SCORE AS score "
-            "RETURN elementId(n) AS nid, score",
-            params={"k": k, "emb": q_emb},
+            "RETURN elementId(n) AS nid, score ORDER BY score DESC",
+            params={"k": search_k, "emb": q_emb},
         )
-        return {r["nid"]: r["score"] for r in res}
+        scores = {r["nid"]: r["score"] for r in res}
+        return self._filter_metadata_scores(scores, k, taxon_filter)
 
     def _fulltext_chunks_metadata(
-        self, q: str, k: int = QUERY_FULL_TEXT_MAX_CHUNKS
+        self, q: str, k: int = METADATA_FULLTEXT_K,
+        taxon_filter: Optional[dict[str, Any]] = None,
     ) -> Dict[str, float]:
         # Fulltext search in metadata_graph via metadata_fulltext_index.
         cleaned_q = self.escape_lucene_plain_text(q)
@@ -874,45 +934,65 @@ Input JSON:
         res = self.graph.query(
             "CALL db.index.fulltext.queryNodes('metadata_fulltext_index', $q) YIELD node, score "
             "RETURN elementId(node) AS nid, score ORDER BY score DESC LIMIT $k",
-            params={"q": cleaned_q, "k": k},
+            params={
+                "q": cleaned_q,
+                "k": k * METADATA_FILTER_OVERFETCH_MULTIPLIER if taxon_filter else k,
+            },
         )
-        return {r["nid"]: r["score"] for r in res}
+        scores = {r["nid"]: r["score"] for r in res}
+        return self._filter_metadata_scores(scores, k, taxon_filter)
 
-    def _expand_one_hop(self, nids: List[str]):
-        # Expand MetadataGraph seed nodes by 1 hop following any relationship, both directions.
+    def _expand_one_hop(
+        self,
+        nids: List[str],
+        taxon_filter: Optional[dict[str, Any]] = None,
+        neighbor_limit_per_seed: int = METADATA_NEIGHBORS_PER_SEED,
+    ):
+        # Expand MetadataGraph seed nodes by one hop in either direction.
         # Returns nodes with all properties plus chunk_id for dedupe/fetch.
-        query = """
+        taxon_clause = ""
+        params = {"nids": nids, "neighbor_limit": neighbor_limit_per_seed}
+        if taxon_filter:
+            params["taxon_regex"] = taxon_regex(taxon_filter)
+            # Unclassified neighbors stay eligible; explicitly classified
+            # neighbors must match the question's crop/species.
+            taxon_clause = """
+            WHERE n2 IS NULL
+               OR (n2.crop IS NULL AND n2.species IS NULL)
+               OR coalesce(toString(n2.crop), '') =~ $taxon_regex
+               OR coalesce(toString(n2.species), '') =~ $taxon_regex
+            """
+        query = f"""
         MATCH (n1:MetadataGraph) WHERE elementId(n1) IN $nids
-        OPTIONAL MATCH (n1)-[r]-(n2)
+        CALL {{
+            WITH n1
+            OPTIONAL MATCH (n1)-[r]-(n2)
+            {taxon_clause}
+            WITH n1, r, n2 ORDER BY elementId(n2)
+            LIMIT $neighbor_limit
+            RETURN
+                collect(DISTINCT CASE WHEN n2 IS NULL THEN NULL ELSE n2 {{
+                    .*, chunk_id: elementId(n2),
+                    source_path: 'Metadata Graph', labels: labels(n2)
+                }} END) AS neighbors,
+                collect(DISTINCT CASE WHEN r IS NULL OR n2 IS NULL THEN NULL ELSE
+                    '[Source: Metadata Graph] ' +
+                    coalesce(n1.displayName, n1.shortName, n1.id, n1.projectName,
+                            n1.accessionName, n1.curatorName, elementId(n1)) +
+                    ' -[' + type(r) + ']- ' +
+                    coalesce(n2.displayName, n2.shortName, n2.id, n2.projectName,
+                            n2.accessionName, n2.curatorName, elementId(n2))
+                END) AS triples
+        }}
         RETURN
-            collect(DISTINCT n1 {
-                .*,
-                chunk_id: elementId(n1),
-                source_path: 'Metadata Graph',
-                labels: labels(n1)
-            }) AS seedchunks,
-
-            collect(DISTINCT n2 {
-                .*,
-                chunk_id: elementId(n2),
-                source_path: 'Metadata Graph',
-                labels: labels(n2)
-            }) AS expandedchunks,
-
-            collect(DISTINCT
-                CASE
-                    WHEN r IS NULL OR n2 IS NULL THEN NULL
-                    ELSE
-                        '[Source: Metadata Graph] ' +
-                        coalesce(n1.displayName, n1.shortName, n1.id, n1.projectName,
-                                n1.accessionName, n1.curatorName, elementId(n1)) +
-                        ' -[' + type(r) + ']- ' +
-                        coalesce(n2.displayName, n2.shortName, n2.id, n2.projectName,
-                                n2.accessionName, n2.curatorName, elementId(n2))
-                END
-            ) AS triples
+            collect(DISTINCT n1 {{
+                .*, chunk_id: elementId(n1),
+                source_path: 'Metadata Graph', labels: labels(n1)
+            }}) AS seedchunks,
+            reduce(acc = [], items IN collect(neighbors) | acc + items) AS expandedchunks,
+            reduce(acc = [], items IN collect(triples) | acc + items) AS triples
         """
-        res = self.graph.query(query, params={"nids": nids})
+        res = self.graph.query(query, params=params)
         if not res or not res[0]["seedchunks"]:
             return [], [], []
         seedchunks = [c for c in res[0]["seedchunks"] if c and c.get("chunk_id")]
@@ -923,24 +1003,48 @@ Input JSON:
         return seedchunks, expandedchunks, triples
 
     def _search_metadata_hybrid(
-        self, expanded_queries: list[str], max_chars: int = METADATA_MAX_CHARACTERS
+        self, expanded_queries: list[str], max_chars: int = METADATA_MAX_CONTEXT_CHARS,
+        taxon_filter: Optional[dict[str, Any]] = None,
     ) -> str:
         # Hybrid search for metadata_graph.
         # Run expanded-query metadata hybrid searches concurrently.
         # Each query also runs vector + full-text concurrently.
-        all_fused = self._multi_query_hybrid_scores_concurrent(
-            expanded_queries,
-            self._vector_chunks_metadata,
-            self._fulltext_chunks_metadata,
-            QUERY_VECTOR_MAX_CHUNKS,
+        vector_fn = lambda query, _k: self._vector_chunks_metadata(
+            query, METADATA_VECTOR_K, taxon_filter
         )
-        # Sort by fused score descending
-        top_nids = sorted(all_fused, key=lambda x: all_fused[x], reverse=True)[
-            :MAX_METADATA_CHUNKS
-        ]
+        fulltext_fn = lambda query, _k: self._fulltext_chunks_metadata(
+            query, METADATA_FULLTEXT_K, taxon_filter
+        )
+        all_fused = self._multi_query_hybrid_scores_concurrent(
+            expanded_queries, vector_fn, fulltext_fn,
+            max(METADATA_VECTOR_K, METADATA_FULLTEXT_K), RRF_RANK_CONSTANT,
+        )
+        ranked = sorted(all_fused.items(), key=lambda item: item[1], reverse=True)
+        # Search deeper than the final result cap so an elbow below the first
+        # few ranks can be detected. The result cap is applied afterwards.
+        scan_count = min(METADATA_RRF_SCAN_LIMIT, len(ranked))
+        elbow_seed_count = scan_count
+        best_drop = 0.0
+        min_seeds = min(METADATA_RRF_MIN_SEEDS, scan_count)
+        for index in range(max(0, min_seeds - 1), scan_count - 1):
+            current_score = ranked[index][1]
+            next_score = ranked[index + 1][1]
+            absolute_drop = current_score - next_score
+            relative_drop = absolute_drop / current_score if current_score else 0.0
+            if (
+                absolute_drop >= METADATA_RRF_MIN_ABSOLUTE_DROP
+                and relative_drop >= METADATA_RRF_MIN_RELATIVE_DROP
+                and relative_drop > best_drop
+            ):
+                best_drop = relative_drop
+                elbow_seed_count = index + 1
+        selected_count = min(elbow_seed_count, METADATA_MAX_RESULTS_AFTER_RRF)
+        top_nids = [nid for nid, _ in ranked[:selected_count]]
         if not top_nids:
             return ""
-        seeded_chunks, expanded_chunks, triples = self._expand_one_hop(top_nids)
+        seeded_chunks, expanded_chunks, triples = self._expand_one_hop(
+            top_nids, taxon_filter, METADATA_NEIGHBORS_PER_SEED
+        )
         all_chunks_deduplicated = self._dedupe_chunks(seeded_chunks + expanded_chunks)
         deduped_nids = [
             c.get("chunk_id") for c in all_chunks_deduplicated if c.get("chunk_id")
@@ -959,7 +1063,7 @@ Input JSON:
         )
         # Limit by max_chars.
         context_parts, total_chars = [], 0
-        for t in triples[:MAX_TRIPLES]:
+        for t in triples[:METADATA_MAX_TRIPLES]:
             text = json.dumps({"relationship": t}, ensure_ascii=False)
             if total_chars + len(text) > max_chars:
                 return "\n".join(context_parts)
@@ -978,9 +1082,14 @@ Input JSON:
             total_chars += len(text)
         return "\n".join(context_parts)
 
-    def _get_metadata_context(self, query: str, expanded_queries: list[str]) -> str:
+    def _get_metadata_context(
+        self, query: str, expanded_queries: list[str],
+        taxon_filter: Optional[dict[str, Any]] = None,
+    ) -> str:
         context_parts = []
-        result = self._search_metadata_hybrid(expanded_queries)
+        result = self._search_metadata_hybrid(
+            expanded_queries, METADATA_MAX_CONTEXT_CHARS, taxon_filter
+        )
         if result:
             context_parts.append(f"### Metadata Graph (Hybrid Search):\n{result}")
         return "\n\n".join(context_parts)
@@ -1123,7 +1232,8 @@ Input JSON:
     # doesn't prevent literature context (or the whole answer) from coming
     # back. A failed source just contributes an empty string.
     def _retrieve_context(
-        self, q: str, expanded_queries: List[str], k: int, max_context_chars: int
+        self, q: str, expanded_queries: List[str], k: int, max_context_chars: int,
+        taxon_filter: Optional[dict[str, Any]] = None,
     ) -> Tuple[str, str, str]:
         def safe_call(fn, label, *args):
             try:
@@ -1142,7 +1252,8 @@ Input JSON:
                 max_context_chars,
             )
             metadata_future = executor.submit(
-                safe_call, self._get_metadata_context, "Metadata", q, expanded_queries
+                safe_call, self._get_metadata_context, "Metadata", q,
+                expanded_queries, taxon_filter
             )
             pretzel_future = None
             if "pretzel" in q.lower():
@@ -1509,9 +1620,18 @@ Input JSON:
 
             # Run literature, metadata, and Pretzel context retrieval concurrently.
             start_time = time.perf_counter()
+            taxon_filter = (
+                resolve_taxon_filter(q, species) if SPECIES_FILTER_ENABLED else None
+            )
+            if taxon_filter:
+                logger.info(
+                    "Filtering metadata graph to crop/species: %s",
+                    taxon_filter["canonical_crops"],
+                )
             literature_context, metadata_context, pretzel_context = (
                 await asyncio.to_thread(
-                    self._retrieve_context, q, expanded_queries, k, max_context_chars
+                    self._retrieve_context, q, expanded_queries, k,
+                    max_context_chars, taxon_filter
                 )
             )
             end_time = time.perf_counter()
