@@ -237,6 +237,31 @@ def _resolve_reasoning_level(reasoning_level: Optional[str]) -> str:
     )
 
 
+def _resolve_max_context_chars(max_context_chars: Optional[int]) -> int:
+    """Same fallback-vs-fail policy as `_resolve_model_name`, for the
+    literature context character budget selected by the frontend's
+    literature context slider (`frontend/components/literature-context-
+    selector.tsx`). Must be an integer within
+    `[MIN_LITERATURE_CONTEXT_CHARS, MAX_LITERATURE_CONTEXT_CHARS]`."""
+    if max_context_chars is None:
+        return MAX_CHARACTERS
+    if (
+        isinstance(max_context_chars, bool)
+        or not isinstance(max_context_chars, int)
+        or not (
+            MIN_LITERATURE_CONTEXT_CHARS
+            <= max_context_chars
+            <= MAX_LITERATURE_CONTEXT_CHARS
+        )
+    ):
+        raise ValueError(
+            f"Invalid max literature context {max_context_chars!r} requested; "
+            f"must be an integer between {MIN_LITERATURE_CONTEXT_CHARS} and "
+            f"{MAX_LITERATURE_CONTEXT_CHARS} characters"
+        )
+    return max_context_chars
+
+
 # CONTEXT OPTIMISATION
 # Metadata retrieval: filter taxon, then fetch vector/full-text candidates.
 SPECIES_FILTER_ENABLED = True
@@ -267,7 +292,12 @@ METADATA_MAX_CONTEXT_CHARS = 20000  # Character budget for metadata context.
 QUERY_VECTOR_MAX_CHUNKS = 40
 QUERY_FULL_TEXT_MAX_CHUNKS = 40
 QUERY_MAX_CHUNKS = 80  # Maximum RRF-ranked literature chunks per expanded query.
-MAX_CHARACTERS = 20000  # Literature context character budget.
+MAX_CHARACTERS = 50000  # Default literature context character budget.
+# Bounds/step for the literature context budget the frontend can select
+# per run (see `_resolve_max_context_chars`); exposed via `GET /options`.
+MIN_LITERATURE_CONTEXT_CHARS = 10000
+MAX_LITERATURE_CONTEXT_CHARS = 100000
+LITERATURE_CONTEXT_CHARS_STEP = 10000
 MAX_TRIPLES = 50
 RERANK_MAX_TEXT_CHARS = 2000
 
@@ -309,6 +339,9 @@ class RunState(BaseModel):
     # their fallbacks - lets the frontend confirm the selection took effect.
     model_name: str = GEMINI_MODEL
     reasoning_level: str = ANSWER_THINKING_LEVEL
+    # Literature context character budget actually used for this run, after
+    # `_resolve_max_context_chars` has applied its fallback.
+    max_context_chars: int = MAX_CHARACTERS
     species: str = ""
     is_agg_accession_query: bool = False
     needs_clarification: bool = False
@@ -1499,7 +1532,11 @@ Input JSON:
         self,
         q: str,
         k: int = QUERY_MAX_CHUNKS,
-        max_context_chars: int = MAX_CHARACTERS,
+        # Literature context character budget. `None` falls back to
+        # `MAX_CHARACTERS`; an explicit out-of-range value raises
+        # `ValueError` (see `_resolve_max_context_chars`), with the same
+        # propagate-and-fail behaviour as the model selection below.
+        max_context_chars: Optional[int] = None,
         # Raw values as forwarded by the frontend's model/reasoning
         # selectors (see `frontend/hooks/use-model-config.ts` and
         # `GraphRAG/main.py`'s reading of `forwardedProps`). Resolved
@@ -1516,15 +1553,18 @@ Input JSON:
         logger.info(f"Start query.")
         resolved_model_name = _resolve_model_name(model_name)
         resolved_reasoning_level = _resolve_reasoning_level(reasoning_level)
+        max_context_chars = _resolve_max_context_chars(max_context_chars)
         logger.info(
-            "Using model=%s reasoning_level=%s",
+            "Using model=%s reasoning_level=%s max_context_chars=%d",
             resolved_model_name,
             resolved_reasoning_level,
+            max_context_chars,
         )
         state = RunState(
             stage=Stage.EXPANDING_QUESTION,
             model_name=resolved_model_name,
             reasoning_level=resolved_reasoning_level,
+            max_context_chars=max_context_chars,
         )
         try:
             # Classify before cache/retrieval so a direct AGG lookup can skip
@@ -1852,6 +1892,16 @@ def main():
         default=None,
         help=f"Answer-generation thinking level. Defaults to {ANSWER_THINKING_LEVEL}.",
     )
+    parser.add_argument(
+        "--max-context-chars",
+        type=int,
+        default=None,
+        help=(
+            "Literature context character budget "
+            f"({MIN_LITERATURE_CONTEXT_CHARS}-{MAX_LITERATURE_CONTEXT_CHARS}). "
+            f"Defaults to {MAX_CHARACTERS}."
+        ),
+    )
     args = parser.parse_args()
 
     rag = PlantBioRAG()
@@ -1861,7 +1911,10 @@ def main():
         final_state = None
         start_time = time.perf_counter()
         async for event in rag.query(
-            args.query, model_name=args.model, reasoning_level=args.reasoning_level
+            args.query,
+            max_context_chars=args.max_context_chars,
+            model_name=args.model,
+            reasoning_level=args.reasoning_level,
         ):
             if isinstance(event, TextEvent):
                 elapsed = time.perf_counter() - start_time
@@ -1877,9 +1930,10 @@ def main():
         if final_state.error:
             logger.error("Run error: %s", final_state.error)
         logger.info(
-            "Model: %s, Reasoning level: %s",
+            "Model: %s, Reasoning level: %s, Max literature context: %d chars",
             final_state.model_name,
             final_state.reasoning_level,
+            final_state.max_context_chars,
         )
         for label, ctx in (
             ("Literature", final_state.literature_context),

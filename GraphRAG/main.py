@@ -27,6 +27,10 @@ from Query import (
     AVAILABLE_MODELS,
     AVAILABLE_REASONING_LEVELS,
     GEMINI_MODEL,
+    LITERATURE_CONTEXT_CHARS_STEP,
+    MAX_CHARACTERS,
+    MAX_LITERATURE_CONTEXT_CHARS,
+    MIN_LITERATURE_CONTEXT_CHARS,
     ErrorEvent,
     PlantBioRAG,
     ReasoningEvent,
@@ -78,6 +82,19 @@ def _forwarded_model_selection(
     )
 
 
+def _forwarded_max_context_chars(input: RunAgentInput) -> Optional[int]:
+    """Reads the frontend's literature context budget out of
+    `forwardedProps`, published by `frontend/components/literature-context-
+    selector.tsx` as `ModelContext.config.maxLiteratureContextChars`.
+    Missing -> `None` (backend default). Anything else is passed through
+    as-is so `PlantBioRAG.query()` can reject invalid values rather than
+    silently substituting the default."""
+    forwarded: Any = input.forwarded_props
+    if not isinstance(forwarded, dict):
+        return None
+    return forwarded.get("maxLiteratureContextChars")
+
+
 def _latest_user_message(input: RunAgentInput) -> str:
     """Single-turn only: drive the pipeline off the latest user message,
     per the plan's scope boundary. Ignores prior conversation history."""
@@ -116,9 +133,11 @@ async def _run_agui_events(input: RunAgentInput) -> AsyncGenerator[str, None]:
         return events
 
     model_name, reasoning_level = _forwarded_model_selection(input)
+    max_context_chars = _forwarded_max_context_chars(input)
     try:
         async for event in rag.query(
             _latest_user_message(input),
+            max_context_chars=max_context_chars,
             model_name=model_name,
             reasoning_level=reasoning_level,
         ):
@@ -200,4 +219,10 @@ async def get_options() -> dict:
         "defaultModel": GEMINI_MODEL,
         "reasoningLevels": AVAILABLE_REASONING_LEVELS,
         "defaultReasoningLevel": ANSWER_THINKING_LEVEL,
+        # Literature context slider
+        # (`frontend/components/literature-context-selector.tsx`).
+        "minLiteratureContextChars": MIN_LITERATURE_CONTEXT_CHARS,
+        "maxLiteratureContextChars": MAX_LITERATURE_CONTEXT_CHARS,
+        "literatureContextCharsStep": LITERATURE_CONTEXT_CHARS_STEP,
+        "defaultLiteratureContextChars": MAX_CHARACTERS,
     }

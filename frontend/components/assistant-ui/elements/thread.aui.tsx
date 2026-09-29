@@ -23,6 +23,7 @@ import {
   ToolGroupTrigger,
 } from "@/components/assistant-ui/elements/tool-group.aui";
 import { TooltipIconButton } from "@/components/assistant-ui/elements/tooltip-icon-button";
+import { LiteratureContextSelector } from "@/components/literature-context-selector";
 import { ModelSelector } from "@/components/model-selector";
 import { Button } from "@/components/ui/button";
 import { Skeleton } from "@/components/ui/skeleton";
@@ -300,6 +301,7 @@ const ComposerAction: FC = () => {
           <ComposerAddAttachment />
         </AuiIf>
         <ModelSelector />
+        <LiteratureContextSelector />
       </div>
       <div className="flex shrink-0 items-center gap-1.5">
         <AuiIf condition={(s) => s.thread.capabilities.dictation}>

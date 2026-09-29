@@ -8,23 +8,7 @@ import {
 } from "@assistant-ui/react";
 import { Thread } from "@/components/assistant-ui/elements/thread.aui";
 import { PipelineStatus } from "@/components/pipeline-status";
-import { PlusIcon } from "lucide-react";
 import type { FC } from "react";
-
-function NewThreadButton() {
-  const aui = useAui();
-
-  return (
-    <button
-      type="button"
-      onClick={() => aui.threads.switchToNewThread()}
-      className="bg-background hover:bg-accent absolute top-4 right-4 z-10 flex items-center gap-2 rounded-lg border px-3 py-2 text-sm font-medium shadow-sm transition-colors"
-    >
-      <PlusIcon className="size-4" />
-      New Thread
-    </button>
-  );
-}
 
 const ThreadWelcome: FC = () => {
   return (
@@ -44,21 +28,19 @@ function ThreadWithSuggestions() {
   const config = AuiConfig({
     suggestions: Suggestions([
       {
-        title: "Look up an accession",
-        label: "in the Australian Grains Genebank",
-        prompt:
-          "Is the wheat variety Wyalkatchem available in the Australian Grains Genebank?",
+        title: "Do any of the 10 wheat genomes",
+        label: "carry Lr46?",
+        prompt: "do any of the 10 wheat genomes carry Lr46?",
       },
       {
-        title: "Ask about a trait",
-        label: "2NS introgression in wheat",
-        prompt:
-          "What evidence is there to suggest the wheat variety Wyalkatchem carries the 2NS introgression?",
+        title: "Do any of the 10 wheat genomes",
+        label: "carry Yr29?",
+        prompt: "do any of the 10 wheat genomes carry Yr29?",
       },
       {
-        title: "Ask about Pretzel",
-        label: "how alignments work",
-        prompt: "How do I align two genome assemblies in Pretzel?",
+        title: "Is there a relationship",
+        label: "between Lr46 and Yr29?",
+        prompt: "is there a relationship between Lr46 and Yr29?",
       },
     ]),
   });
@@ -74,7 +56,6 @@ export default function Home() {
     <main className="relative flex h-dvh flex-col">
       <PipelineStatus />
       <div className="relative min-h-0 flex-1">
-        <NewThreadButton />
         <ThreadWithSuggestions />
       </div>
     </main>
