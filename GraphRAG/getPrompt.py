@@ -17,14 +17,21 @@ _promptCache = {}
 
 
 def getPrompt(promptName):
-    """Return and cache ``promptName`` from the configured prompts directory."""
+    """Return and cache ``promptName`` from the configured prompts directory.
+
+    ``promptsDir`` overrides the location. Otherwise prompts are read from the
+    repository ``prompts/`` directory next to ``GraphRAG/``, so the lookup does
+    not depend on the process working directory.
+    """
     if promptName in _promptCache:
         return _promptCache[promptName]
 
-    promptsDir = os.getenv("promptsDir") or "prompts"
-    if not promptsDir:
-        raise RuntimeError("The promptsDir environment variable is not set")
+    promptsDir = os.getenv("promptsDir")
+    if promptsDir:
+        promptsPath = Path(promptsDir)
+    else:
+        promptsPath = Path(__file__).resolve().parent.parent / "prompts"
 
-    promptText = (Path(promptsDir) / promptName).read_text(encoding="utf-8")
+    promptText = (promptsPath / promptName).read_text(encoding="utf-8")
     _promptCache[promptName] = promptText
     return promptText

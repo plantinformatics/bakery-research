@@ -296,7 +296,7 @@ MAX_CHARACTERS = 50000  # Default literature context character budget.
 # Bounds/step for the literature context budget the frontend can select
 # per run (see `_resolve_max_context_chars`); exposed via `GET /options`.
 MIN_LITERATURE_CONTEXT_CHARS = 10000
-MAX_LITERATURE_CONTEXT_CHARS = 100000
+MAX_LITERATURE_CONTEXT_CHARS = 500000
 LITERATURE_CONTEXT_CHARS_STEP = 10000
 MAX_TRIPLES = 50
 RERANK_MAX_TEXT_CHARS = 2000
