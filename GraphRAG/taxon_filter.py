@@ -96,6 +96,22 @@ def metadata_matches_taxon(
     return allow_unclassified
 
 
+def text_is_clearly_other_taxon(
+    text: Any, taxon_filter: dict[str, Any] | None
+) -> bool:
+    """Reject text only when it names other known taxa but none of the targets.
+
+    Mixed-species passages and passages with no recognizable taxonomy remain
+    eligible, since a mere mention of another crop is not enough to classify
+    the chunk as irrelevant.
+    """
+    if not taxon_filter or not text:
+        return False
+    mentioned = _canonical_taxa(text)
+    targets = set(taxon_filter.get("canonical_crops", []))
+    return bool(mentioned) and not bool(mentioned & targets)
+
+
 def taxon_regex(taxon_filter: dict[str, Any]) -> str:
     """Create a word-bounded Java regex for Cypher neighbor filtering."""
     alternatives = []
