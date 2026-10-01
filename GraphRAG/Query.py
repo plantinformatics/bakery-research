@@ -22,10 +22,11 @@ from enum import Enum
 from pydantic import BaseModel, Field
 import numpy as np
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from threading import local
 from dotenv import load_dotenv
 
 from getPrompt import getPrompt
-from taxon_filter import metadata_matches_taxon, resolve_taxon_filter, taxon_regex
+from taxon_filter import metadata_matches_taxon, resolve_taxon_filter, taxon_regex, text_is_clearly_other_taxon
 
 load_dotenv(Path(__file__).resolve().parents[1] / ".env")
 
@@ -275,31 +276,34 @@ RRF_RANK_CONSTANT = 60  # Standard reciprocal-rank denominator offset.
 # Metadata retrieval: elbow cutoff, neighbor expansion, then context limits.
 METADATA_RRF_MIN_SEEDS = 5  # Minimum retained before a score-drop cutoff is allowed.
 METADATA_RRF_SCAN_LIMIT = 80  # Ranked candidates inspected to find an elbow.
-METADATA_RRF_MIN_RELATIVE_DROP = (
-    0.35  # Minimum fractional drop between adjacent scores.
-)
-METADATA_RRF_MIN_ABSOLUTE_DROP = (
-    0.005  # Minimum absolute drop as well as relative drop.
-)
+METADATA_RRF_MIN_RELATIVE_DROP = 0.35  # Minimum fractional drop between adjacent scores.
+METADATA_RRF_MIN_ABSOLUTE_DROP = 0.005  # Minimum absolute drop as well as relative drop.
 METADATA_MAX_RESULTS_AFTER_RRF = 40  # Hard cap after applying the elbow cutoff.
 METADATA_NEIGHBORS_PER_SEED = 2  # Maximum adjacent metadata nodes per selected seed.
-METADATA_MAX_TRIPLES = (
-    50  # Maximum relationship descriptions included in metadata context.
-)
+METADATA_MAX_TRIPLES = 50  # Maximum relationship descriptions included in metadata context.
 METADATA_MAX_CONTEXT_CHARS = 20000  # Character budget for metadata context.
 
 # Literature/Pretzel retrieval defaults; vector and full-text limits are per query.
 QUERY_VECTOR_MAX_CHUNKS = 40
 QUERY_FULL_TEXT_MAX_CHUNKS = 40
 QUERY_MAX_CHUNKS = 80  # Maximum RRF-ranked literature chunks per expanded query.
-MAX_CHARACTERS = 50000  # Default literature context character budget.
 # Bounds/step for the literature context budget the frontend can select
 # per run (see `_resolve_max_context_chars`); exposed via `GET /options`.
 MIN_LITERATURE_CONTEXT_CHARS = 10000
 MAX_LITERATURE_CONTEXT_CHARS = 500000
 LITERATURE_CONTEXT_CHARS_STEP = 10000
 MAX_TRIPLES = 50
-RERANK_MAX_TEXT_CHARS = 2000
+LITERATURE_TRIPLE_MAX_CHARACTERS = 5000  # Separate budget for literature relationships.
+RERANK_MAX_TEXT_CHARS = 1500  # Passage excerpt sent to the semantic evidence judge.
+RERANK_CANDIDATES_PER_QUERY = 3  # Preserve candidates from each generated query.
+RERANK_BATCH_SIZE = 16  # Batch size for the extra semantic-ranking calls.
+RERANK_MIN_SCORE = 2.0  # Exclude topic-only mentions; allow indirect and direct evidence.
+RERANK_MAX_METADATA_CHARS = 3000  # Metadata scope shown to the evidence judge.
+RERANK_MODEL = "gemini-2.5-flash"  # Lower-cost model used only for literature relevance scoring.
+
+# USER ADJUSTABLE VARIABLES 
+LITERATURE_CHUNKS_TO_RERANK = 80  # Maximum literature chunks sent to relevance ranking per request.
+MAX_CHARACTERS = 50000  # The final size of the literature context sent to the LLM.
 
 # Accession API config
 ACCESSION_API_URL = os.getenv("ACCESSION_API_URL") or ""
@@ -355,6 +359,7 @@ class RunState(BaseModel):
     literature_context: Optional[str] = None
     metadata_context: Optional[str] = None
     pretzel_context: Optional[str] = None
+    retrieval_diagnostics: dict = Field(default_factory=dict)
     error: Optional[str] = None
 
 
@@ -400,6 +405,18 @@ class PlantBioRAG:
         # accession extraction/presentation) - these aren't exposed to the
         # frontend's model/reasoning selectors, only the final answer is.
         self.llm = ChatGoogleGenerativeAI(model=GEMINI_MODEL, temperature=0)
+        self._reranker_llm = ChatGoogleGenerativeAI(
+            model=RERANK_MODEL, temperature=0, thinking_budget=0
+        )
+        self._chunk_reranker_usage = local()
+        self._chunk_reranker_usage.value = {
+            "model": RERANK_MODEL,
+            "calls": 0,
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "total_tokens": 0,
+            "available": True,
+        }
         # Answer-generation clients, one per (model_name, reasoning_level)
         # combo actually requested so far, built lazily by `_get_answer_llm`.
         # Separate from `self.llm` so only the final-answer call requests
@@ -533,84 +550,549 @@ class PlantBioRAG:
 
     # One literature search branch for one expanded query
     def _search_literature_one_query(
-        self, expanded_query: str, k: int, max_chars_for_query: int
+        self,
+        expanded_query: str,
+        k: int,
+        original_question: str,
+        taxon_filter: Optional[dict[str, Any]] = None,
     ) -> dict:
         fused = self._hybrid_scores_concurrent(
             expanded_query, self._vector_chunks, self._fulltext_chunks, k
         )
-        seed_cids = sorted(fused, key=lambda x: fused[x], reverse=True)[:k]
+        ranked_cids = sorted(fused, key=lambda cid: fused[cid], reverse=True)
+        candidate_rows = self.graph.query(
+            """
+            MATCH (c:Chunk) WHERE c.chunk_id IN $cids
+            RETURN c.chunk_id AS chunk_id, c.source_path AS source_path,
+                   c.text AS text
+            """,
+            params={"cids": ranked_cids},
+        ) if ranked_cids else []
+        candidate_by_id = {row["chunk_id"]: row for row in candidate_rows}
+        taxonomy_rejected_ids = {
+            cid for cid in ranked_cids
+            if cid in candidate_by_id
+            and text_is_clearly_other_taxon(candidate_by_id[cid].get("text"), taxon_filter)
+        }
+        eligible_ranked_cids = [cid for cid in ranked_cids if cid not in taxonomy_rejected_ids]
+        seed_cids = eligible_ranked_cids[:k]
+        outside_top_k_ids = eligible_ranked_cids[k:]
         seeded_chunks, expanded_chunks, triples = self._expand_hops(seed_cids)
-        all_chunks_deduplicated = self._dedupe_chunks(seeded_chunks + expanded_chunks)
-        context_chunks, total_characters = [], 0
-        for chunk in all_chunks_deduplicated:
+        all_chunks = self._dedupe_chunks(seeded_chunks + expanded_chunks)
+        expanded_chunk_scores: dict[str, float] = {}
+        for triple in triples:
+            expanded_id = triple.get("expanded_chunk_id")
+            seed_id = triple.get("seed_chunk_id")
+            if expanded_id and seed_id:
+                expanded_chunk_scores[expanded_id] = max(expanded_chunk_scores.get(expanded_id, 0.0), fused.get(seed_id, 0.0))
+
+        candidates = []
+        expanded_chunk_ids = {chunk.get("chunk_id") for chunk in expanded_chunks}
+        for cid in taxonomy_rejected_ids:
+            row = candidate_by_id[cid]
+            candidates.append({
+                "chunk_id": cid, "source_path": row.get("source_path", ""),
+                "text": row.get("text", ""), "rrf_score": fused[cid],
+                "included": False,
+                "rejection_reason": "Clearly identified as a different taxonomy",
+            })
+        for cid in outside_top_k_ids:
+            if cid in expanded_chunk_ids:
+                continue
+            row = candidate_by_id.get(cid)
+            if row and row.get("text"):
+                candidates.append({
+                    "chunk_id": cid, "source_path": row.get("source_path", ""),
+                    "text": row["text"], "rrf_score": fused[cid],
+                    "included": False, "rejection_reason": "Outside RRF top-K",
+                })
+        for chunk in all_chunks:
             text = chunk.get("text", "")
             if not text:
                 continue
-            if total_characters + len(text) > max_chars_for_query:
-                break
-            context_chunks.append(
-                {
-                    "chunk_id": chunk.get("chunk_id"),
-                    "source_path": chunk.get("source_path", ""),
-                    "text": text,
+            chunk_id = chunk.get("chunk_id")
+            candidates.append({
+                "chunk_id": chunk_id, "source_path": chunk.get("source_path", ""),
+                "text": text,
+                "rrf_score": fused.get(chunk_id, expanded_chunk_scores.get(chunk_id)),
+                "rejection_reason": (
+                    "Clearly identified as a different taxonomy"
+                    if text_is_clearly_other_taxon(text, taxon_filter) else None
+                ),
+            })
+        excluded_seed_ids = {
+            item["chunk_id"] for item in candidates
+            if item["rejection_reason"] and item["chunk_id"] in seed_cids
+        }
+        for item in candidates:
+            item["included"] = False
+
+        triple_by_text: dict[str, dict[str, Any]] = {}
+        for triple in triples:
+            text = triple["text"]
+            relation_text = re.sub(r"^\[Source: .*?\]\s*", "", text)
+            seed_id = triple.get("seed_chunk_id")
+            score = fused.get(seed_id, 0.0)
+            taxonomy_rejected = seed_id in excluded_seed_ids
+            current = triple_by_text.get(text)
+            if current is None or (
+                (current["rejection_reason"] and not taxonomy_rejected)
+                or (bool(current["rejection_reason"]) == taxonomy_rejected
+                    and score > current["rrf_score"])
+            ):
+                triple_by_text[text] = {
+                    "text": text, "rrf_score": score,
+                    "relevance_score": self._triple_relevance_score(original_question, relation_text),
+                    "included": False,
+                    "rejection_reason": (
+                        "Clearly identified as a different taxonomy" if taxonomy_rejected else None
+                    ),
                 }
-            )
-            total_characters += len(text)
         return {
             "expanded_query": expanded_query,
-            "context_chunks": context_chunks,
-            "triples": triples[:MAX_TRIPLES],
+            "diagnostics": {"chunks": candidates, "triples": list(triple_by_text.values())},
         }
+
+    @staticmethod
+    def _triple_relevance_score(question: str, relationship: str) -> float:
+        """Favor question entities and biological edges over graph boilerplate."""
+        question_lower = question.casefold()
+        question_words = set(re.findall(r"[a-z0-9]+", question_lower))
+        stop_words = {
+            "which", "what", "where", "when", "who", "does", "do", "any",
+            "the", "of", "in", "on", "to", "for", "a", "an", "is", "are",
+            "have", "has", "carry", "carries", "carrying", "genome", "genomes",
+        }
+        question_terms = {
+            token for token in re.findall(r"[a-z0-9]+", question_lower)
+            if token not in stop_words and not token.isdigit()
+        }
+        endpoints = re.sub(r"-\[[A-Z_]+\]->", " ", relationship)
+        endpoint_terms = set(re.findall(r"[a-z0-9]+", endpoints.casefold()))
+        overlap = len(question_terms & endpoint_terms)
+        question_entities = set(re.findall(
+            r"\b(?:lr|yr)\s*\d+[a-z0-9]*\b", question_lower
+        ))
+        matched_entities = sum(
+            bool(re.search(rf"\b{re.escape(entity)}\b", endpoints.casefold()))
+            for entity in question_entities
+        )
+        score = matched_entities * 10.0 + min(overlap, 8) * 2.5
+        relation_match = re.search(r"-\[([A-Z_]+)\]->", relationship)
+        normalized_type = relation_match.group(1).replace("_", "") if relation_match else ""
+        if normalized_type in {"CARRIES", "CARRIESGENE", "HASGENE"} and question_words & {
+            "carry", "carries", "carrying", "have", "has", "possess",
+            "possesses", "contain", "contains",
+        }:
+            score += 15.0
+        if normalized_type in {
+            "PLEIOTROPICTO", "CONFERSRESISTANCETO", "CARRIES", "CARRIESGENE",
+            "HASGENE", "LOCATEDON", "ASSOCIATEDWITH", "ASSOCIATEDWITHTRAIT",
+        }:
+            score += 1.0
+        if normalized_type in {"CITEDIN", "HASDOI", "BELONGSTOSPECIES"}:
+            score -= 5.0
+        if normalized_type in {"HASPROJECT", "HASASSEMBLY"}:
+            score -= 2.0
+        return score
+
+    def _semantic_rerank_chunks(
+        self,
+        question: str,
+        expanded_queries: list[str],
+        metadata_context: str,
+        candidates: list[dict[str, Any]],
+    ) -> dict[str, dict[str, Any]]:
+        """Judge answer evidence in small batches with the dedicated reranker LLM."""
+        results: dict[str, dict[str, Any]] = {}
+        self._chunk_reranker_usage.value = {
+            "model": RERANK_MODEL,
+            "calls": 0,
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "total_tokens": 0,
+            "available": True,
+        }
+        query_hints = [query for query in expanded_queries if query != question][:12]
+        metadata_scope = metadata_context[:RERANK_MAX_METADATA_CHARS]
+        for start in range(0, len(candidates), RERANK_BATCH_SIZE):
+            batch = candidates[start : start + RERANK_BATCH_SIZE]
+            payload = [
+                {
+                    "id": index,
+                    "source": item.get("source_path", ""),
+                    "text": item.get("text", "")[:RERANK_MAX_TEXT_CHARS],
+                }
+                for index, item in enumerate(batch)
+            ]
+            prompt = getPrompt("literature_relevance_judge").rstrip() + "\n" + json.dumps(
+                {
+                    "question": question,
+                    "generated_queries": query_hints,
+                    "metadata_scope": metadata_scope,
+                    "passages": payload,
+                },
+                ensure_ascii=False,
+            )
+            response = self._reranker_llm.invoke(prompt)
+            usage_totals = self._chunk_reranker_usage.value
+            usage_totals["calls"] += 1
+            usage = getattr(response, "usage_metadata", None)
+            if not isinstance(usage, dict):
+                usage = {}
+            for token_key in ("input_tokens", "output_tokens", "total_tokens"):
+                token_count = usage.get(token_key)
+                if isinstance(token_count, int) and not isinstance(token_count, bool):
+                    usage_totals[token_key] += token_count
+                else:
+                    usage_totals["available"] = False
+            raw = self._message_text(response).strip()
+            clean = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw.strip(), flags=re.I)
+            parsed = json.loads(clean)
+            for item in parsed.get("items", []):
+                try:
+                    candidate = batch[int(item["id"])]
+                    score = max(0.0, min(4.0, float(item["score"])))
+                except (KeyError, TypeError, ValueError, IndexError):
+                    continue
+                entities = item.get("entities", [])
+                if not isinstance(entities, list):
+                    entities = []
+                results[str(candidate.get("chunk_id") or id(candidate))] = {
+                    "semantic_score": score,
+                    "evidence_entities": sorted({
+                        " ".join(entity.split())
+                        for entity in entities
+                        if isinstance(entity, str) and entity.strip()
+                    }),
+                }
+        return results
+
+    @staticmethod
+    def _boost_connected_triple_relevance(
+        question: str, triples: list[dict[str, Any]]
+    ) -> None:
+        """Promote one-hop biological evidence linked to a question-matched triple."""
+        stop_words = {
+            "which", "what", "where", "when", "who", "does", "do", "any",
+            "the", "of", "in", "on", "to", "for", "a", "an", "is", "are",
+            "have", "has", "carry", "carries", "carrying", "genome", "genomes",
+        }
+        question_terms = {
+            token for token in re.findall(r"[a-z0-9]+", question.casefold())
+            if token not in stop_words and not token.isdigit()
+        }
+        def matches_question(endpoint: str) -> bool:
+            terms = set(re.findall(r"[a-z0-9]+", endpoint.casefold()))
+            return bool(terms & question_terms)
+
+        parsed = []
+        bridge_entities = set()
+        for item in triples:
+            match = re.match(
+                r"^\s*(.*?)\s*-\[([A-Z_]+)\]->\s*(.*?)\s*$",
+                item["relationship"],
+            )
+            if not match:
+                continue
+            source, relation_type, target = match.groups()
+            normalized_type = relation_type.replace("_", "")
+            source_norm, target_norm = source.casefold(), target.casefold()
+            source_question = matches_question(source)
+            target_question = matches_question(target)
+            parsed.append((item, source_norm, target_norm, normalized_type))
+            if normalized_type not in {
+                "PLEIOTROPICTO", "CONFERSRESISTANCETO", "CARRIES", "CARRIESGENE",
+                "HASGENE", "LOCATEDON", "ASSOCIATEDWITH", "ASSOCIATEDWITHTRAIT",
+            }:
+                continue
+            if source_question and not target_question:
+                bridge_entities.add(target_norm)
+            elif target_question and not source_question:
+                bridge_entities.add(source_norm)
+
+        for item, source, target, normalized_type in parsed:
+            if normalized_type in {
+                "PLEIOTROPICTO", "CONFERSRESISTANCETO", "CARRIES", "CARRIESGENE",
+                "HASGENE", "LOCATEDON", "ASSOCIATEDWITH", "ASSOCIATEDWITHTRAIT",
+            } and (source in bridge_entities or target in bridge_entities):
+                item["relevance_score"] += 10.0
 
     # Run all expanded literature searches concurrently
     def _get_literature_context_concurrent(
-        self, expanded_queries: list[str], k: int, max_context_chars: int
-    ) -> str:
+        self, expanded_queries: list[str], k: int, max_context_chars: int,
+        taxon_filter: Optional[dict[str, Any]] = None,
+        include_diagnostics: bool = False,
+        original_question: Optional[str] = None,
+        metadata_context_future: Optional[Any] = None,
+    ) -> str | tuple[str, dict[str, Any]]:
         if not expanded_queries:
-            return ""
-        max_chars_for_query = int(max_context_chars / max(1, len(expanded_queries)))
-        results_by_query: dict[str, dict] = {}
+            return ("", {"chunks": [], "triples": []}) if include_diagnostics else ""
+        relevance_question = original_question or " ".join(expanded_queries)
+        chunks_by_id: dict[Any, dict[str, Any]] = {}
+        deduplicated: dict[str, dict[str, Any]] = {}
         with ThreadPoolExecutor(max_workers=min(8, len(expanded_queries))) as executor:
-            future_to_query = {
+            futures = {
                 executor.submit(
-                    self._search_literature_one_query, eq, k, max_chars_for_query
-                ): eq
-                for eq in expanded_queries
+                    self._search_literature_one_query,
+                    query,
+                    k,
+                    relevance_question,
+                    taxon_filter,
+                ): query for query in expanded_queries
             }
-            for future in as_completed(future_to_query):
-                eq = future_to_query[future]
-                results_by_query[eq] = future.result()
-        # Preserve expanded_queries order in final prompt
-        added_chunk_keys = set()
-        parts = []
-        for eq in expanded_queries:
-            result = results_by_query.get(eq)
-            if not result:
-                continue
-            context_chunks = []
-            for chunk in result["context_chunks"]:
-                cid = chunk.get("chunk_id")
-                source_path = chunk.get("source_path", "")
-                text = chunk.get("text", "")
-                key = cid if cid else (source_path, hash(text))
-                if key in added_chunk_keys:
-                    continue
-                added_chunk_keys.add(key)
-                context_chunks.append(f"[Source: {source_path}] {text}\n")
-            triple_summ = "\n".join(result["triples"])
-            parts.append(
-                f"""
-                For sub-question
-                {eq}
+            for future in as_completed(futures):
+                query = futures[future]
+                result = future.result()
+                for item in result["diagnostics"]["chunks"]:
+                    chunk_id = item.get("chunk_id")
+                    key = chunk_id or (item.get("source_path", ""), hash(item.get("text", "")))
+                    current = chunks_by_id.get(key)
+                    score = item.get("rrf_score") or 0.0
+                    if current is None:
+                        is_eligible = item.get("rejection_reason") is None
+                        current = {
+                            **item,
+                            "included": False,
+                            "rejection_reason": item.get("rejection_reason"),
+                            "_eligible": is_eligible,
+                            "_query_scores": {query: score} if is_eligible else {},
+                            "_rejected_score": score if not is_eligible else 0.0,
+                        }
+                        current["rrf_score"] = score
+                        chunks_by_id[key] = current
+                    else:
+                        if item.get("rejection_reason") is None:
+                            current["_eligible"] = True
+                            current["rejection_reason"] = None
+                            current["_query_scores"][query] = max(
+                                current["_query_scores"].get(query, 0.0), score
+                            )
+                            current["rrf_score"] = sum(current["_query_scores"].values())
+                        else:
+                            current["_rejected_score"] = max(
+                                current["_rejected_score"], score
+                            )
+                            if not current["_eligible"]:
+                                current["rrf_score"] = current["_rejected_score"]
+                for item in result["diagnostics"]["triples"]:
+                    match = re.match(r"^\[Source: (.*?)\]\s*(.*)$", item["text"])
+                    sources = set(match.group(1).split("; ")) if match else set()
+                    relationship = match.group(2) if match else item["text"]
+                    key = " ".join(relationship.casefold().split())
+                    current = deduplicated.get(key)
+                    if current is None:
+                        current = {
+                            "relationship": relationship, "sources": set(),
+                            "rrf_score": item["rrf_score"],
+                            "relevance_score": item["relevance_score"],
+                            "included": False, "rejection_reason": item["rejection_reason"],
+                        }
+                        deduplicated[key] = current
+                    current["sources"].update(sources)
+                    current["rrf_score"] = max(current["rrf_score"], item["rrf_score"])
+                    current["relevance_score"] = max(
+                        current["relevance_score"], item["relevance_score"]
+                    )
+                    if item["rejection_reason"] is None:
+                        current["rejection_reason"] = None
+                result["diagnostics"]["triples"] = []
 
-                ### Context Chunks are:
-                {os.linesep.join(context_chunks)}
+        metadata_context = metadata_context_future.result() if metadata_context_future else ""
+        all_chunks = list(chunks_by_id.values())
+        rrf_ranked = sorted(
+            all_chunks,
+            key=lambda item: item.get("rrf_score") or 0.0,
+            reverse=True,
+        )
+        for rank, item in enumerate(rrf_ranked, start=1):
+            item["rrf_rank"] = rank
 
-                ### Entity Relationships are:
-                {triple_summ}
-                """
+        eligible_chunks = [item for item in all_chunks if item.get("rejection_reason") is None]
+        rerank_pool: list[dict[str, Any]] = []
+        pool_ids = set()
+        for query in expanded_queries:
+            query_ranked = sorted(
+                (item for item in eligible_chunks if query in item.get("_query_scores", {})),
+                key=lambda item: item["_query_scores"][query],
+                reverse=True,
             )
-        return "\n".join(parts)
+            for item in query_ranked[:RERANK_CANDIDATES_PER_QUERY]:
+                identity = item.get("chunk_id") or id(item)
+                if identity not in pool_ids and len(rerank_pool) < LITERATURE_CHUNKS_TO_RERANK:
+                    pool_ids.add(identity)
+                    rerank_pool.append(item)
+        for item in rrf_ranked:
+            if len(rerank_pool) >= LITERATURE_CHUNKS_TO_RERANK:
+                break
+            identity = item.get("chunk_id") or id(item)
+            if item in eligible_chunks and identity not in pool_ids:
+                pool_ids.add(identity)
+                rerank_pool.append(item)
+        reranker_error = None
+        try:
+            rerank_results = self._semantic_rerank_chunks(
+                relevance_question, expanded_queries, metadata_context, rerank_pool
+            )
+            if len(rerank_results) != len(rerank_pool):
+                raise ValueError("Semantic reranker returned an incomplete result set")
+            for item in rerank_pool:
+                result = rerank_results[str(item.get("chunk_id") or id(item))]
+                item.update(result)
+        except Exception as error:
+            logger.warning("Literature semantic reranking failed; using RRF order: %s", error)
+            reranker_error = str(error)
+            rerank_pool = eligible_chunks
+            for item in eligible_chunks:
+                item["semantic_score"] = None
+                item["evidence_entities"] = []
+
+        for item in eligible_chunks:
+            if item.get("semantic_score") is None and rerank_pool is not eligible_chunks:
+                item["rejection_reason"] = "Outside semantic reranker candidate pool"
+        semantic_available = bool(rerank_pool) and rerank_pool[0].get("semantic_score") is not None
+        ranked_pool = sorted(
+            rerank_pool,
+            key=lambda item: (
+                item.get("semantic_score") if semantic_available else 0.0,
+                item.get("rrf_score") or 0.0,
+                -len(item.get("text", "")),
+            ),
+            reverse=True,
+        )
+        for rank, item in enumerate(ranked_pool, start=1):
+            item["rank"] = rank
+            if semantic_available and item["semantic_score"] < RERANK_MIN_SCORE:
+                item["rejection_reason"] = "Below semantic relevance threshold"
+
+        ranked_chunks = sorted(
+            all_chunks,
+            key=lambda item: (
+                item.get("rank") is None,
+                item.get("rank") or item.get("rrf_rank", 0),
+            ),
+        )
+        grouped_chunks = {query: [] for query in expanded_queries}
+        included_chars = 0
+        nonempty_groups = 0
+        selection_pool = [
+            item for item in ranked_pool
+            if item.get("rejection_reason") is None
+        ]
+        selected_entities = set()
+        selection_rank = 0
+        while selection_pool:
+            options = []
+            for item in selection_pool:
+                query_scores = item.get("_query_scores", {})
+                best_query = (
+                    max(query_scores, key=query_scores.get)
+                    if query_scores else expanded_queries[0]
+                )
+                starts_group = not grouped_chunks.setdefault(best_query, [])
+                framing_chars = (
+                    len(f"\nFor sub-question\n{best_query}\n\n### Context Chunks are:\n")
+                    + (1 if nonempty_groups else 0)
+                    if starts_group else len(os.linesep)
+                )
+                rendered_chunk = f"[Source: {item.get('source_path', '')}] {item.get('text', '')}\n"
+                cost = len(rendered_chunk) + framing_chars
+                entity_labels = {
+                    " ".join(entity.split()).casefold(): " ".join(entity.split())
+                    for entity in item.get("evidence_entities", [])
+                }
+                novel_entity_keys = set(entity_labels) - selected_entities
+                novel_entities = [entity_labels[key] for key in novel_entity_keys]
+                utility = (item.get("semantic_score") or 0.0) + min(len(novel_entities), 4) * 0.25
+                options.append((utility / max(cost, 1), item, best_query, starts_group, rendered_chunk, novel_entities, novel_entity_keys, cost))
+            _, item, best_query, starts_group, rendered_chunk, novel_entities, novel_entity_keys, cost = max(
+                options, key=lambda option: option[0]
+            )
+            selection_pool.remove(item)
+            item.pop("_eligible", None)
+            item.pop("_rejected_score", None)
+            if included_chars + cost > max_context_chars:
+                item["rejection_reason"] = "Out of context size bound"
+                continue
+            item["included"] = True
+            selection_rank += 1
+            item["selection_rank"] = selection_rank
+            item["new_evidence_entities"] = sorted(novel_entities)
+            selected_entities.update(novel_entity_keys)
+            included_chars += cost
+            if starts_group:
+                nonempty_groups += 1
+            grouped_chunks[best_query].append(rendered_chunk)
+
+        diagnostics = {
+            "chunks": [
+                {key: value for key, value in item.items() if not key.startswith("_")}
+                for item in ranked_chunks
+            ],
+            "triples": [],
+            "chunk_reranker": {
+                "method": "LLM evidence relevance + marginal entity coverage per character",
+                "model": RERANK_MODEL,
+                "candidate_count": len(eligible_chunks),
+                "scored_count": sum(item.get("semantic_score") is not None for item in ranked_pool),
+                "candidate_limit": LITERATURE_CHUNKS_TO_RERANK,
+                "minimum_score": RERANK_MIN_SCORE,
+                "token_usage": dict(self._chunk_reranker_usage.value),
+                "fallback_error": reranker_error,
+            },
+        }
+        logger.info(
+            "Literature relevance reranker usage (%s): %s tokens total (%s input, %s output)",
+            RERANK_MODEL,
+            self._chunk_reranker_usage.value["total_tokens"] if self._chunk_reranker_usage.value["available"] else "not reported",
+            self._chunk_reranker_usage.value["input_tokens"],
+            self._chunk_reranker_usage.value["output_tokens"],
+        )
+        parts = [
+            f"\nFor sub-question\n{query}\n\n### Context Chunks are:\n"
+            + os.linesep.join(grouped_chunks.get(query, []))
+            for query in expanded_queries
+            if grouped_chunks.get(query)
+        ]
+
+        triple_candidates = list(deduplicated.values())
+        self._boost_connected_triple_relevance(relevance_question, triple_candidates)
+        triple_candidates.sort(
+            key=lambda item: (
+                item["relevance_score"],
+                item["rrf_score"],
+                item["relationship"].casefold(),
+            ),
+            reverse=True,
+        )
+        selected_triples, triple_chars = [], 0
+        relationship_header = "### Entity Relationships (deduplicated and question-ranked):\n"
+        for rank, item in enumerate(triple_candidates, start=1):
+            item["rank"] = rank
+            item["text"] = (
+                f"[Source: {'; '.join(sorted(item['sources']))}] "
+                f"{item['relationship']}"
+            )
+            if item["rejection_reason"]:
+                continue
+            if len(selected_triples) >= MAX_TRIPLES:
+                item["rejection_reason"] = "Outside relationship count limit"
+            elif triple_chars + len(item["text"]) > LITERATURE_TRIPLE_MAX_CHARACTERS:
+                item["rejection_reason"] = "Out of relationship context size bound"
+            else:
+                item["included"] = True
+                selected_triples.append(item["text"])
+                triple_chars += len(item["text"])
+        diagnostics["triples"] = [
+            {key: item[key] for key in (
+                "text", "rrf_score", "relevance_score", "rank", "included", "rejection_reason"
+            )}
+            for item in triple_candidates
+        ]
+        if selected_triples:
+            parts.append(relationship_header + "\n".join(selected_triples))
+        context = "\n".join(parts)
+        return (context, diagnostics) if include_diagnostics else context
 
     # 2. Full-text indexing
     def _fulltext_chunks(
@@ -684,16 +1166,20 @@ class PlantBioRAG:
             CASE
                 WHEN r IS NULL THEN NULL
                 WHEN c2.source_path IS NULL OR c2.source_path = c1.source_path THEN
-                    '[Source: ' + coalesce(c1.source_path, '') + '] ' + n.id + ' -[' + type(r) + ']-> ' + m.id
+                    {text: '[Source: ' + coalesce(c1.source_path, '') + '] ' + n.id + ' -[' + type(r) + ']-> ' + m.id,
+                     seed_chunk_id: c1.chunk_id,
+                     expanded_chunk_id: c2.chunk_id}
                 ELSE
-                    '[Source: ' + coalesce(c1.source_path, '') + '; ' + coalesce(c2.source_path, '') + '] ' + n.id + ' -[' + type(r) + ']-> ' + m.id
+                    {text: '[Source: ' + coalesce(c1.source_path, '') + '; ' + coalesce(c2.source_path, '') + '] ' + n.id + ' -[' + type(r) + ']-> ' + m.id,
+                     seed_chunk_id: c1.chunk_id,
+                     expanded_chunk_id: c2.chunk_id}
             END
         ) AS triples
         """
         res = self.graph.query(query, params={"cids": cids})
         if not res or not res[0]["seedchunks"]:
             return [], [], []
-        # Filter out "None -[None]-> None" strings
+        # Ignore null rows and retain chunk provenance for evidence-based scores.
         triples = [t for t in res[0]["triples"] if t is not None]
         return res[0]["seedchunks"], res[0]["expandedchunks"], triples
 
@@ -1315,7 +1801,7 @@ Input JSON:
         k: int,
         max_context_chars: int,
         taxon_filter: Optional[dict[str, Any]] = None,
-    ) -> Tuple[str, str, str]:
+    ) -> Tuple[str, str, str, dict[str, Any]]:
         def safe_call(fn, label, *args):
             try:
                 return fn(*args)
@@ -1324,14 +1810,6 @@ Input JSON:
                 return ""
 
         with ThreadPoolExecutor(max_workers=3) as executor:
-            literature_future = executor.submit(
-                safe_call,
-                self._get_literature_context_concurrent,
-                "Literature",
-                expanded_queries,
-                k,
-                max_context_chars,
-            )
             metadata_future = executor.submit(
                 safe_call,
                 self._get_metadata_context,
@@ -1340,15 +1818,34 @@ Input JSON:
                 expanded_queries,
                 taxon_filter,
             )
+            literature_future = executor.submit(
+                safe_call,
+                self._get_literature_context_concurrent,
+                "Literature",
+                expanded_queries,
+                k,
+                max_context_chars,
+                taxon_filter,
+                True,
+                q,
+                metadata_future,
+            )
             pretzel_future = None
             if "pretzel" in q.lower():
                 pretzel_future = executor.submit(
                     safe_call, self._get_pretzel_context, "Pretzel", expanded_queries
                 )
-            literature_context = literature_future.result()
+            literature_result = literature_future.result()
+            if isinstance(literature_result, tuple):
+                literature_context, literature_diagnostics = literature_result
+            else:
+                literature_context = literature_result
+                literature_diagnostics = {"chunks": [], "triples": []}
             metadata_context = metadata_future.result()
             pretzel_context = pretzel_future.result() if pretzel_future else ""
-        return literature_context, metadata_context, pretzel_context
+        return literature_context, metadata_context, pretzel_context, {
+            "literature": literature_diagnostics
+        }
 
     # Pure string assembly - no I/O, so nothing to catch here.
     def _build_answer_prompt(
@@ -1719,10 +2216,15 @@ Input JSON:
             )
             if taxon_filter:
                 logger.info(
-                    "Filtering metadata graph to crop/species: %s",
+                    "Applying conservative crop/species filtering: %s",
                     taxon_filter["canonical_crops"],
                 )
-            literature_context, metadata_context, pretzel_context = (
+            (
+                literature_context,
+                metadata_context,
+                pretzel_context,
+                retrieval_diagnostics,
+            ) = (
                 await asyncio.to_thread(
                     self._retrieve_context,
                     q,
@@ -1746,6 +2248,7 @@ Input JSON:
                     "literature_context": literature_context or None,
                     "metadata_context": metadata_context or None,
                     "pretzel_context": pretzel_context or None,
+                    "retrieval_diagnostics": retrieval_diagnostics,
                 }
             )
 
@@ -1756,6 +2259,20 @@ Input JSON:
                 metadata_context,
                 pretzel_context,
             )
+            print("\n========== FINAL CONTEXT SENT TO THE ANSWER LLM ==========")
+            context_char_count = 0
+            for label, context in (
+                ("Literature", literature_context),
+                ("Metadata Graph", metadata_context),
+                ("Pretzel Documentation", pretzel_context),
+            ):
+                context = context or ""
+                context_char_count += len(context)
+                print(f"\n--- {label} ({len(context):,} characters) ---")
+                print(context if context else "[No context]")
+            print(f"\nTotal retrieved context: {context_char_count:,} characters")
+            print(f"Total answer prompt: {len(prompt):,} characters")
+            print("========== END FINAL CONTEXT ==========\n")
 
             state = state.model_copy(update={"stage": Stage.GENERATING_ANSWER})
             yield StageChangeEvent(state=state)
