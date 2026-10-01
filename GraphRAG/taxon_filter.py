@@ -34,20 +34,16 @@ def _normalise(value: Any) -> str:
     return " ".join(re.findall(r"[a-z0-9]+", str(value).casefold()))
 
 
-def _contains_alias(text: str, alias: str) -> bool:
-    normalised_text = f" {_normalise(text)} "
-    normalised_alias = f" {_normalise(alias)} "
-    return normalised_alias in normalised_text
-
-
 def _canonical_taxa(value: Any) -> set[str]:
     if value is None:
         return set()
+    normalised_value = _normalise(value)
+    padded_value = f" {normalised_value} "
     return {
         canonical
         for canonical, aliases in TAXON_ALIASES.items()
-        if any(_contains_alias(value, alias) for alias in aliases)
-        or (canonical == "field pea" and _normalise(value) == "fieldpea")
+        if any(f" {_normalise(alias)} " in padded_value for alias in aliases)
+        or (canonical == "field pea" and normalised_value == "fieldpea")
     }
 
 
