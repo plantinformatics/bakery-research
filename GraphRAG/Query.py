@@ -143,20 +143,32 @@ def summarise_token_tally(
     token_tally: list, elapsed_seconds: Optional[float] = None
 ) -> dict:
     """Sum per-step token usage into RunState.token_usage and log the run total."""
-    total = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
-    reasoning = 0
+
+    def sum_usage(entries: list) -> dict:
+        usage = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
+        reasoning = 0
+        for entry in entries:
+            for key in usage:
+                usage[key] += entry.get(key) or 0
+            reasoning += (entry.get("output_token_details") or {}).get("reasoning") or 0
+        if reasoning:
+            usage["output_token_details"] = {"reasoning": reasoning}
+        return usage
+
+    total = sum_usage(token_tally)
+    entries_by_model: dict[str, list] = {}
     for entry in token_tally:
-        for key in total:
-            total[key] += entry.get(key) or 0
-        reasoning += (entry.get("output_token_details") or {}).get("reasoning") or 0
-    if reasoning:
-        total["output_token_details"] = {"reasoning": reasoning}
+        entries_by_model.setdefault(entry["model"] or "unknown model", []).append(entry)
+    by_model = {model: sum_usage(entries) for model, entries in entries_by_model.items()}
+
     logger.info("─" * 60)
     logger.info(
         "End Query - total usage%s: %s",
         f" ({elapsed_seconds:.1f} sec.)" if elapsed_seconds is not None else "",
         total,
     )
+    for model, usage in by_model.items():
+        logger.info("    %s: %s", model, usage)
     # Per-step lines were already logged by log_step; repeat them only at DEBUG.
     for entry in token_tally:
         logger.debug(
@@ -165,7 +177,7 @@ def summarise_token_tally(
             entry["model"] or "unknown model",
             {k: v for k, v in entry.items() if k not in ("step", "model")},
         )
-    return {"total": total, "by_step": list(token_tally)}
+    return {"total": total, "by_model": by_model, "by_step": list(token_tally)}
 
 
 GEMINI_EMBEDDING_MODEL = "models/gemini-embedding-001"
@@ -1363,12 +1375,10 @@ class PlantBioRAG:
             },
         }
         logger.info(
-            "Literature relevance reranker usage (%s): %s tokens total (%s input, %s output), in batches of (%s)",
+            "Literature relevance reranker usage (%s, batches of %s): %s",
             RERANK_MODEL,
-            self._chunk_reranker_usage.value["total_tokens"] if self._chunk_reranker_usage.value["available"] else "not reported",
-            self._chunk_reranker_usage.value["input_tokens"],
-            self._chunk_reranker_usage.value["output_tokens"],
             RERANK_BATCH_SIZE,
+            self._chunk_reranker_usage.value,
         )
         
         parts = [
