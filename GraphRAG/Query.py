@@ -96,7 +96,15 @@ logging.getLogger("neo4j.notifications").setLevel(
 )  # comment out in future if fixed upstream
 logger = logging.getLogger(__name__)
 # Set LOG_LEVEL=DEBUG to see per-stage diagnostics from this module only.
-logger.setLevel(os.getenv("LOG_LEVEL", "INFO").upper())
+# Accepts a level name (any case) or number; anything else falls back to INFO.
+_log_level_setting = (os.getenv("LOG_LEVEL") or "INFO").strip()
+_log_level = (
+    int(_log_level_setting) if _log_level_setting.isdigit()
+    else logging.getLevelNamesMapping().get(_log_level_setting.upper())
+)
+logger.setLevel(_log_level if _log_level is not None else logging.INFO)
+if _log_level is None:
+    logger.warning("Unknown LOG_LEVEL %r; using INFO.", _log_level_setting)
 
 
 @contextmanager
