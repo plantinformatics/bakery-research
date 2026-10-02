@@ -56,6 +56,30 @@ function TokenUsageBreakdown({ tally }: { tally: TokenUsageTally }) {
   );
 }
 
+function RetrievalQueries({ queries }: { queries: string[] }) {
+  const [open, setOpen] = useState(false);
+
+  return (
+    <Collapsible open={open} onOpenChange={setOpen}>
+      <CollapsibleTrigger className="text-muted-foreground hover:text-foreground text-left text-xs underline decoration-dotted underline-offset-2">
+        Retrieval queries ({queries.length})
+      </CollapsibleTrigger>
+      <CollapsibleContent className="mt-1">
+        <ol className="text-muted-foreground flex flex-col gap-0.5 text-[11px]">
+          {queries.map((query, index) => (
+            <li key={`${index}-${query}`}>
+              <span className="font-medium">
+                {index === 0 ? "Original" : `${index}.`}
+              </span>{" "}
+              {query}
+            </li>
+          ))}
+        </ol>
+      </CollapsibleContent>
+    </Collapsible>
+  );
+}
+
 function RetrievedContext({ state }: { state: PlantBioRunState }) {
   const [open, setOpen] = useState(false);
   const { isCopied, copyToClipboard } = useCopyToClipboard();
@@ -199,6 +223,10 @@ export function PipelineStatus() {
           <p className="text-muted-foreground text-xs">
             Expanded: {state.expanded_question}
           </p>
+        ) : null}
+
+        {state?.retrieval_queries?.length ? (
+          <RetrievalQueries queries={state.retrieval_queries} />
         ) : null}
 
         {accessions.length > 0 ? (
