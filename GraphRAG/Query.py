@@ -15,6 +15,7 @@ from langchain_neo4j import Neo4jGraph, Neo4jVector
 import requests
 import re
 import json
+import hashlib
 import warnings
 import logging
 import time
@@ -26,6 +27,8 @@ from threading import local
 from dotenv import load_dotenv
 
 from getPrompt import getPrompt
+from literature_graph_expansion import expand_literature_graph
+from literature_candidate_ranking import literature_candidate_sort_key, score_literature_candidate_texts, score_literature_candidate_vectors
 from taxon_filter import metadata_matches_taxon, resolve_taxon_filter, taxon_regex, text_is_clearly_other_taxon
 
 load_dotenv(Path(__file__).resolve().parents[1] / ".env")
@@ -297,6 +300,7 @@ LITERATURE_TRIPLE_MAX_CHARACTERS = 5000  # Separate budget for literature relati
 RERANK_MAX_TEXT_CHARS = 1500  # Passage excerpt sent to the semantic evidence judge.
 RERANK_CANDIDATES_PER_QUERY = 3  # Preserve candidates from each generated query.
 RERANK_BATCH_SIZE = 16  # Batch size for the extra semantic-ranking calls.
+RERANK_MAX_CONCURRENT_BATCHES = 3  # Independent judge calls in flight; lower if API rate-limited.
 RERANK_MIN_SCORE = 2.0  # Exclude topic-only mentions; allow indirect and direct evidence.
 RERANK_MAX_METADATA_CHARS = 3000  # Metadata scope shown to the evidence judge.
 RERANK_MODEL = "gemini-2.5-flash"  # Lower-cost model used only for literature relevance scoring.
@@ -510,13 +514,46 @@ class PlantBioRAG:
         fulltext_fn,
         k: int,
         rrf_k: int = RRF_RANK_CONSTANT,
+        diagnostics: Optional[dict] = None,
     ) -> Dict[str, float]:
+        started = time.perf_counter()
         with ThreadPoolExecutor(max_workers=2) as executor:
             vector_future = executor.submit(vector_fn, q, k)
             fulltext_future = executor.submit(fulltext_fn, q, k)
             vector_scores = vector_future.result()
             fulltext_scores = fulltext_future.result()
-        return self._rrf_fusion(vector_scores, fulltext_scores, rrf_k)
+        fused = self._rrf_fusion(vector_scores, fulltext_scores, rrf_k)
+        if diagnostics is not None:
+            diagnostics.update({
+                "query": q, "escaped_fulltext_query": self.escape_lucene_plain_text(q),
+                "effective_vector_k": k, "effective_fulltext_k": k,
+                "rrf_constant": rrf_k, "elapsed_seconds": time.perf_counter() - started,
+                "return_order_note": "Insertion order of unique chunk IDs in the existing score maps, after deduplication and missing-ID removal.",
+                "ranking": {},
+            })
+            for label, scores in (("vector", vector_scores), ("fulltext", fulltext_scores)):
+                return_order = {cid: index for index, cid in enumerate(scores, start=1)}
+                diagnostics["ranking"][label] = [
+                    {"chunk_id": cid, "score": float(score), "rank": rank,
+                     "return_order": return_order[cid], "rrf_contribution": 1.0 / (rrf_k + rank)}
+                    for rank, (cid, score) in enumerate(
+                        sorted(scores.items(), key=lambda item: item[1], reverse=True), start=1
+                    )
+                ]
+            diagnostics["ranking"]["rrf"] = [
+                {"chunk_id": cid, "score": fused[cid], "rank": rank}
+                for rank, cid in enumerate(sorted(fused, key=fused.get, reverse=True), start=1)
+            ]
+            diagnostics["ties"] = {}
+            for label, ranking in diagnostics["ranking"].items():
+                groups = {}
+                for item in ranking:
+                    groups.setdefault(item["score"], []).append(item["chunk_id"])
+                diagnostics["ties"][label] = [
+                    {"score": score, "chunk_ids_in_rank_order": ids}
+                    for score, ids in groups.items() if len(ids) > 1
+                ]
+        return fused
 
     # Run expanded-query searches concurrently
     def _multi_query_hybrid_scores_concurrent(
@@ -556,10 +593,12 @@ class PlantBioRAG:
         original_question: str,
         taxon_filter: Optional[dict[str, Any]] = None,
     ) -> dict:
+        search_trace = {}
         fused = self._hybrid_scores_concurrent(
-            expanded_query, self._vector_chunks, self._fulltext_chunks, k
+            expanded_query, self._vector_chunks, self._fulltext_chunks, k,
+            diagnostics=search_trace,
         )
-        ranked_cids = sorted(fused, key=lambda cid: fused[cid], reverse=True)
+        ranked_cids = sorted(fused, key=lambda cid: (-fused[cid], cid))
         candidate_rows = self.graph.query(
             """
             MATCH (c:Chunk) WHERE c.chunk_id IN $cids
@@ -577,14 +616,23 @@ class PlantBioRAG:
         eligible_ranked_cids = [cid for cid in ranked_cids if cid not in taxonomy_rejected_ids]
         seed_cids = eligible_ranked_cids[:k]
         outside_top_k_ids = eligible_ranked_cids[k:]
-        seeded_chunks, expanded_chunks, triples = self._expand_hops(seed_cids)
+        seeded_chunks, expanded_chunks, triples, expansion_timings = expand_literature_graph(
+            self.graph, seed_cids, [candidate_by_id[cid] for cid in seed_cids if cid in candidate_by_id]
+        )
+        logger.info("Literature graph expansion [%s]: %.2fs", expanded_query, expansion_timings["total_seconds"])
+        search_trace["graph_expansion"] = expansion_timings
+        postprocess_started = time.perf_counter()
         all_chunks = self._dedupe_chunks(seeded_chunks + expanded_chunks)
         expanded_chunk_scores: dict[str, float] = {}
+        seed_ids_by_expanded_chunk: dict[Any, set[str]] = {}
         for triple in triples:
-            expanded_id = triple.get("expanded_chunk_id")
             seed_id = triple.get("seed_chunk_id")
-            if expanded_id and seed_id:
-                expanded_chunk_scores[expanded_id] = max(expanded_chunk_scores.get(expanded_id, 0.0), fused.get(seed_id, 0.0))
+            for expanded_id in triple.get("expanded_chunk_ids", [triple.get("expanded_chunk_id")]):
+                if seed_id:
+                    seed_ids_by_expanded_chunk.setdefault(expanded_id, set()).add(seed_id)
+                if expanded_id and seed_id:
+                    expanded_chunk_scores[expanded_id] = max(expanded_chunk_scores.get(expanded_id, 0.0), fused.get(seed_id, 0.0))
+        provenance_index_seconds = time.perf_counter() - postprocess_started
 
         candidates = []
         expanded_chunk_ids = {chunk.get("chunk_id") for chunk in expanded_chunks}
@@ -615,6 +663,7 @@ class PlantBioRAG:
                 "chunk_id": chunk_id, "source_path": chunk.get("source_path", ""),
                 "text": text,
                 "rrf_score": fused.get(chunk_id, expanded_chunk_scores.get(chunk_id)),
+                "is_direct_search_match": chunk_id in fused,
                 "rejection_reason": (
                     "Clearly identified as a different taxonomy"
                     if text_is_clearly_other_taxon(text, taxon_filter) else None
@@ -626,11 +675,33 @@ class PlantBioRAG:
         }
         for item in candidates:
             item["included"] = False
+            cid = item.get("chunk_id")
+            item["retrieval_queries"] = [{
+                "query": expanded_query,
+                "per_query_rrf_score": item.get("rrf_score"),
+                "first_query_rejection_reason": item.get("rejection_reason"),
+                "is_seed": cid in seed_cids,
+                "is_expanded_chunk": cid in expanded_chunk_ids,
+                "expanded_from_seed_ids": sorted(seed_ids_by_expanded_chunk.get(cid, ())),
+            }]
+        search_trace.update({
+            "seed_limit": k, "seed_chunk_ids": seed_cids,
+            "taxonomy_rejected_ids": sorted(taxonomy_rejected_ids),
+            "outside_rrf_top_k_ids": outside_top_k_ids,
+            "expanded_chunk_ids": sorted(cid for cid in expanded_chunk_ids if cid),
+            "missing_graph_chunk_ids": [cid for cid in ranked_cids if cid not in candidate_by_id],
+            "fetched_chunk_metadata": [
+                {"chunk_id": cid, "source_path": row.get("source_path"),
+                 "text_chars": len(row.get("text") or ""),
+                 "text_sha256": hashlib.sha256((row.get("text") or "").encode("utf-8")).hexdigest()}
+                for cid, row in candidate_by_id.items()
+            ],
+        })
 
+        relationship_dedup_started = time.perf_counter()
         triple_by_text: dict[str, dict[str, Any]] = {}
         for triple in triples:
             text = triple["text"]
-            relation_text = re.sub(r"^\[Source: .*?\]\s*", "", text)
             seed_id = triple.get("seed_chunk_id")
             score = fused.get(seed_id, 0.0)
             taxonomy_rejected = seed_id in excluded_seed_ids
@@ -640,16 +711,34 @@ class PlantBioRAG:
                 or (bool(current["rejection_reason"]) == taxonomy_rejected
                     and score > current["rrf_score"])
             ):
+                relevance_score = current["relevance_score"] if current is not None else self._triple_relevance_score(
+                    original_question, re.sub(r"^\[Source: .*?\]\s*", "", text)
+                )
                 triple_by_text[text] = {
                     "text": text, "rrf_score": score,
-                    "relevance_score": self._triple_relevance_score(original_question, relation_text),
+                    "relevance_score": relevance_score,
                     "included": False,
                     "rejection_reason": (
                         "Clearly identified as a different taxonomy" if taxonomy_rejected else None
                     ),
                 }
+        postprocess_timings = {
+            "provenance_index_seconds": provenance_index_seconds,
+            "candidate_build_seconds": relationship_dedup_started - postprocess_started - provenance_index_seconds,
+            "relationship_dedup_seconds": time.perf_counter() - relationship_dedup_started,
+            "total_seconds": time.perf_counter() - postprocess_started,
+        }
+        search_trace["post_expansion_processing"] = postprocess_timings
+        logger.debug(
+            "Literature post-expansion [%s]: %.2fs (provenance index %.2fs, candidates %.2fs, relationship dedup %.2fs)",
+            expanded_query, postprocess_timings["total_seconds"],
+            postprocess_timings["provenance_index_seconds"],
+            postprocess_timings["candidate_build_seconds"],
+            postprocess_timings["relationship_dedup_seconds"],
+        )
         return {
             "expanded_query": expanded_query,
+            "search_trace": search_trace,
             "diagnostics": {"chunks": candidates, "triples": list(triple_by_text.values())},
         }
 
@@ -705,6 +794,7 @@ class PlantBioRAG:
     ) -> dict[str, dict[str, Any]]:
         """Judge answer evidence in small batches with the dedicated reranker LLM."""
         results: dict[str, dict[str, Any]] = {}
+        self._chunk_reranker_usage.batches = []
         self._chunk_reranker_usage.value = {
             "model": RERANK_MODEL,
             "calls": 0,
@@ -715,8 +805,16 @@ class PlantBioRAG:
         }
         query_hints = [query for query in expanded_queries if query != question][:12]
         metadata_scope = metadata_context[:RERANK_MAX_METADATA_CHARS]
+        prepared_batches = []
         for start in range(0, len(candidates), RERANK_BATCH_SIZE):
             batch = candidates[start : start + RERANK_BATCH_SIZE]
+            batch_number = start // RERANK_BATCH_SIZE + 1
+            for index, candidate in enumerate(batch):
+                candidate["sent_to_relevance_ranker"] = True
+                candidate["reranker_batch"] = batch_number
+                candidate["reranker_passage_id"] = index
+                candidate["reranker_text_chars"] = len(candidate.get("text", "")[:RERANK_MAX_TEXT_CHARS])
+                candidate["reranker_text_truncated"] = len(candidate.get("text", "")) > RERANK_MAX_TEXT_CHARS
             payload = [
                 {
                     "id": index,
@@ -734,38 +832,71 @@ class PlantBioRAG:
                 },
                 ensure_ascii=False,
             )
-            response = self._reranker_llm.invoke(prompt)
-            usage_totals = self._chunk_reranker_usage.value
-            usage_totals["calls"] += 1
-            usage = getattr(response, "usage_metadata", None)
-            if not isinstance(usage, dict):
-                usage = {}
-            for token_key in ("input_tokens", "output_tokens", "total_tokens"):
-                token_count = usage.get(token_key)
-                if isinstance(token_count, int) and not isinstance(token_count, bool):
-                    usage_totals[token_key] += token_count
-                else:
-                    usage_totals["available"] = False
-            raw = self._message_text(response).strip()
-            clean = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw.strip(), flags=re.I)
-            parsed = json.loads(clean)
-            for item in parsed.get("items", []):
+            batch_trace = {
+                "batch": batch_number, "model": RERANK_MODEL,
+                "candidate_ids_in_input_order": [item.get("diagnostic_id") or item.get("chunk_id") for item in batch],
+                "prompt": prompt, "prompt_chars": len(prompt),
+                "prompt_sha256": hashlib.sha256(prompt.encode("utf-8")).hexdigest(),
+                "status": "started",
+            }
+            self._chunk_reranker_usage.batches.append(batch_trace)
+            prepared_batches.append((batch, prompt, batch_trace))
+        with ThreadPoolExecutor(max_workers=min(RERANK_MAX_CONCURRENT_BATCHES, len(prepared_batches) or 1)) as executor:
+            submitted = [(batch, trace, executor.submit(self._reranker_llm.invoke, prompt), time.perf_counter())
+                         for batch, prompt, trace in prepared_batches]
+            for batch, batch_trace, future, started in submitted:
                 try:
-                    candidate = batch[int(item["id"])]
-                    score = max(0.0, min(4.0, float(item["score"])))
-                except (KeyError, TypeError, ValueError, IndexError):
-                    continue
-                entities = item.get("entities", [])
-                if not isinstance(entities, list):
-                    entities = []
-                results[str(candidate.get("chunk_id") or id(candidate))] = {
-                    "semantic_score": score,
-                    "evidence_entities": sorted({
-                        " ".join(entity.split())
-                        for entity in entities
-                        if isinstance(entity, str) and entity.strip()
-                    }),
-                }
+                    response = future.result()
+                except Exception as error:
+                    batch_trace.update({"status": "call_failed", "error": str(error),
+                                        "elapsed_seconds": time.perf_counter() - started})
+                    raise
+                batch_trace.update({
+                    "status": "response_received", "elapsed_seconds": time.perf_counter() - started,
+                    "response_id": getattr(response, "id", None),
+                    "response_metadata": getattr(response, "response_metadata", {}),
+                })
+                usage_totals = self._chunk_reranker_usage.value
+                usage_totals["calls"] += 1
+                usage = getattr(response, "usage_metadata", None)
+                if not isinstance(usage, dict):
+                    usage = {}
+                batch_trace["usage_metadata"] = usage
+                for token_key in ("input_tokens", "output_tokens", "total_tokens"):
+                    token_count = usage.get(token_key)
+                    if isinstance(token_count, int) and not isinstance(token_count, bool):
+                        usage_totals[token_key] += token_count
+                    else:
+                        usage_totals["available"] = False
+                raw = self._message_text(response).strip()
+                batch_trace["raw_response"] = raw
+                clean = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw.strip(), flags=re.I)
+                try:
+                    parsed = json.loads(clean)
+                except Exception as error:
+                    batch_trace.update({"status": "parse_failed", "error": str(error)})
+                    raise
+                batch_trace["parsed_response"] = parsed
+                batch_trace["status"] = "parsed"
+                for item in parsed.get("items", []):
+                    try:
+                        candidate = batch[int(item["id"])]
+                        score = max(0.0, min(4.0, float(item["score"])))
+                    except (KeyError, TypeError, ValueError, IndexError):
+                        continue
+                    entities = item.get("entities", [])
+                    if not isinstance(entities, list):
+                        entities = []
+                    reason = item.get("reason", "")
+                    results[str(candidate.get("chunk_id") or id(candidate))] = {
+                        "semantic_score": score,
+                        "semantic_reason": reason.strip() if isinstance(reason, str) else "",
+                        "evidence_entities": sorted({
+                            " ".join(entity.split())
+                            for entity in entities
+                            if isinstance(entity, str) and entity.strip()
+                        }),
+                    }
         return results
 
     @staticmethod
@@ -828,9 +959,12 @@ class PlantBioRAG:
     ) -> str | tuple[str, dict[str, Any]]:
         if not expanded_queries:
             return ("", {"chunks": [], "triples": []}) if include_diagnostics else ""
+        literature_started = time.perf_counter()
         relevance_question = original_question or " ".join(expanded_queries)
         chunks_by_id: dict[Any, dict[str, Any]] = {}
         deduplicated: dict[str, dict[str, Any]] = {}
+        searches = {}
+        completion_order = []
         with ThreadPoolExecutor(max_workers=min(8, len(expanded_queries))) as executor:
             futures = {
                 executor.submit(
@@ -844,6 +978,8 @@ class PlantBioRAG:
             for future in as_completed(futures):
                 query = futures[future]
                 result = future.result()
+                completion_order.append(query)
+                searches[query] = result["search_trace"]
                 for item in result["diagnostics"]["chunks"]:
                     chunk_id = item.get("chunk_id")
                     key = chunk_id or (item.get("source_path", ""), hash(item.get("text", "")))
@@ -862,6 +998,8 @@ class PlantBioRAG:
                         current["rrf_score"] = score
                         chunks_by_id[key] = current
                     else:
+                        current["retrieval_queries"].extend(item.get("retrieval_queries", []))
+                        current["is_direct_search_match"] = bool(current.get("is_direct_search_match") or item.get("is_direct_search_match"))
                         if item.get("rejection_reason") is None:
                             current["_eligible"] = True
                             current["rejection_reason"] = None
@@ -898,15 +1036,47 @@ class PlantBioRAG:
                         current["rejection_reason"] = None
                 result["diagnostics"]["triples"] = []
 
+        search_seconds = time.perf_counter() - literature_started
+        logger.info("Literature hybrid retrieval + graph expansion: %.2fs", search_seconds)
+        metadata_wait_started = time.perf_counter()
         metadata_context = metadata_context_future.result() if metadata_context_future else ""
+        metadata_wait_seconds = time.perf_counter() - metadata_wait_started
+        if metadata_context_future:
+            logger.debug("Literature wait for metadata context: %.2fs", metadata_wait_seconds)
         all_chunks = list(chunks_by_id.values())
+        lexical_started = time.perf_counter()
+        score_literature_candidate_texts(all_chunks, relevance_question, expanded_queries)
+        lexical_seconds = time.perf_counter() - lexical_started
+        vector_timings = {}
+        vector_tie_break_error = None
+        try:
+            vector_scored_count = score_literature_candidate_vectors(
+                all_chunks, relevance_question, self.graph, self.emb, vector_timings
+            )
+        except Exception as error:
+            vector_scored_count = 0
+            vector_tie_break_error = str(error)
+            logger.warning("Literature candidate vector tie-break unavailable: %s", error)
+        logger.info(
+            "Literature candidate scoring: lexical %.2fs, question embedding %.2fs, Neo4j cosine %.2fs (%d chunks scored)",
+            lexical_seconds, vector_timings.get("question_embedding", 0.0),
+            vector_timings.get("neo4j_cosine", 0.0), vector_scored_count,
+        )
+        pool_started = time.perf_counter()
         rrf_ranked = sorted(
             all_chunks,
-            key=lambda item: item.get("rrf_score") or 0.0,
-            reverse=True,
+            key=lambda item: literature_candidate_sort_key(item, item.get("rrf_score")),
         )
         for rank, item in enumerate(rrf_ranked, start=1):
             item["rrf_rank"] = rank
+            item["rrf_eligible_query_contributions"] = dict(item.get("_query_scores", {}))
+            item["text_chars"] = len(item.get("text", ""))
+            item["text_sha256"] = hashlib.sha256(item.get("text", "").encode("utf-8")).hexdigest()
+            item["diagnostic_id"] = item.get("chunk_id") or item["text_sha256"]
+            item["sent_to_relevance_ranker"] = False
+        combined_rrf_groups = {}
+        for item in rrf_ranked:
+            combined_rrf_groups.setdefault(item.get("rrf_score") or 0.0, []).append(item.get("chunk_id"))
 
         eligible_chunks = [item for item in all_chunks if item.get("rejection_reason") is None]
         rerank_pool: list[dict[str, Any]] = []
@@ -914,8 +1084,7 @@ class PlantBioRAG:
         for query in expanded_queries:
             query_ranked = sorted(
                 (item for item in eligible_chunks if query in item.get("_query_scores", {})),
-                key=lambda item: item["_query_scores"][query],
-                reverse=True,
+                key=lambda item: literature_candidate_sort_key(item, item["_query_scores"][query]),
             )
             for item in query_ranked[:RERANK_CANDIDATES_PER_QUERY]:
                 identity = item.get("chunk_id") or id(item)
@@ -930,6 +1099,10 @@ class PlantBioRAG:
                 pool_ids.add(identity)
                 rerank_pool.append(item)
         reranker_error = None
+        pool_ids_in_order = [item["diagnostic_id"] for item in rerank_pool]
+        pool_seconds = time.perf_counter() - pool_started
+        logger.debug("Literature candidate pool selection: %.2fs (%d chunks)", pool_seconds, len(rerank_pool))
+        reranker_started = time.perf_counter()
         try:
             rerank_results = self._semantic_rerank_chunks(
                 relevance_question, expanded_queries, metadata_context, rerank_pool
@@ -946,6 +1119,8 @@ class PlantBioRAG:
             for item in eligible_chunks:
                 item["semantic_score"] = None
                 item["evidence_entities"] = []
+        reranker_seconds = time.perf_counter() - reranker_started
+        logger.info("Literature relevance judge: %.2fs", reranker_seconds)
 
         for item in eligible_chunks:
             if item.get("semantic_score") is None and rerank_pool is not eligible_chunks:
@@ -1005,10 +1180,16 @@ class PlantBioRAG:
                 novel_entities = [entity_labels[key] for key in novel_entity_keys]
                 utility = (item.get("semantic_score") or 0.0) + min(len(novel_entities), 4) * 0.25
                 options.append((utility / max(cost, 1), item, best_query, starts_group, rendered_chunk, novel_entities, novel_entity_keys, cost))
-            _, item, best_query, starts_group, rendered_chunk, novel_entities, novel_entity_keys, cost = max(
+            utility_per_char, item, best_query, starts_group, rendered_chunk, novel_entities, novel_entity_keys, cost = max(
                 options, key=lambda option: option[0]
             )
             selection_pool.remove(item)
+            item["budget_decision"] = {
+                "assigned_query": best_query, "rendered_cost_chars": cost,
+                "context_chars_before_decision": included_chars, "context_limit_chars": max_context_chars,
+                "utility_per_character": utility_per_char,
+                "new_evidence_entities_at_decision": sorted(novel_entities),
+            }
             item.pop("_eligible", None)
             item.pop("_rejected_score", None)
             if included_chars + cost > max_context_chars:
@@ -1024,7 +1205,37 @@ class PlantBioRAG:
                 nonempty_groups += 1
             grouped_chunks[best_query].append(rendered_chunk)
 
+        rejection_stages = {
+            "Clearly identified as a different taxonomy": "taxonomy_filter",
+            "Outside RRF top-K": "per_query_rrf_limit",
+            "Outside semantic reranker candidate pool": "reranker_candidate_limit",
+            "Below semantic relevance threshold": "semantic_score_threshold",
+            "Out of context size bound": "final_context_budget",
+        }
+        for item in ranked_chunks:
+            item["first_rejection_stage"] = rejection_stages.get(item.get("rejection_reason"))
+            item["semantic_rank"] = item.get("rank")
         diagnostics = {
+            "run_trace": {
+                "question_used_for_relevance": relevance_question,
+                "expanded_queries_in_input_order": expanded_queries,
+                "query_completion_order": completion_order,
+                "combined_rrf_ids_in_rank_order": [item.get("chunk_id") for item in rrf_ranked],
+                "combined_rrf_ties": [
+                    {"score": score, "chunk_ids_in_rank_order": ids}
+                    for score, ids in combined_rrf_groups.items() if len(ids) > 1
+                ],
+                "searches": [searches[query] for query in expanded_queries],
+                "rerank_candidate_ids_in_input_order": pool_ids_in_order,
+                "reranker_batches": getattr(self._chunk_reranker_usage, "batches", []),
+                "metadata_scope_used_by_judge": metadata_context[:RERANK_MAX_METADATA_CHARS],
+                "metadata_scope_truncated": len(metadata_context) > RERANK_MAX_METADATA_CHARS,
+                "rrf_aggregation_rule": "Sum per-query RRF only for eligible branches; otherwise retain maximum rejected-branch score. Expanded chunks inherit the maximum originating seed score per query.",
+                "rrf_tie_rule": "Equal RRF scores use each chunk's vector similarity to the question, then question-term overlap, direct-search status, and chunk ID.",
+                "vector_tie_break_scored_count": vector_scored_count,
+                "vector_tie_break_error": vector_tie_break_error,
+                "budget_tie_rule": "Equal utility-per-character choices retain ranked-pool order.",
+            },
             "chunks": [
                 {key: value for key, value in item.items() if not key.startswith("_")}
                 for item in ranked_chunks
@@ -1042,12 +1253,14 @@ class PlantBioRAG:
             },
         }
         logger.info(
-            "Literature relevance reranker usage (%s): %s tokens total (%s input, %s output)",
+            "Literature relevance reranker usage (%s): %s tokens total (%s input, %s output), in batches of (%s)",
             RERANK_MODEL,
             self._chunk_reranker_usage.value["total_tokens"] if self._chunk_reranker_usage.value["available"] else "not reported",
             self._chunk_reranker_usage.value["input_tokens"],
             self._chunk_reranker_usage.value["output_tokens"],
+            RERANK_BATCH_SIZE,
         )
+        
         parts = [
             f"\nFor sub-question\n{query}\n\n### Context Chunks are:\n"
             + os.linesep.join(grouped_chunks.get(query, []))
@@ -1092,6 +1305,25 @@ class PlantBioRAG:
         if selected_triples:
             parts.append(relationship_header + "\n".join(selected_triples))
         context = "\n".join(parts)
+        total_seconds = time.perf_counter() - literature_started
+        other_seconds = total_seconds - (
+            search_seconds + metadata_wait_seconds + lexical_seconds
+            + vector_timings.get("question_embedding", 0.0)
+            + vector_timings.get("neo4j_cosine", 0.0)
+            + pool_seconds + reranker_seconds
+        )
+        diagnostics["run_trace"]["timings_seconds"] = {
+            "search_and_graph_expansion": search_seconds,
+            "metadata_wait": metadata_wait_seconds,
+            "lexical_scoring": lexical_seconds,
+            "question_embedding": vector_timings.get("question_embedding", 0.0),
+            "neo4j_cosine": vector_timings.get("neo4j_cosine", 0.0),
+            "candidate_pool": pool_seconds,
+            "relevance_judge": reranker_seconds,
+            "other_and_context_assembly": other_seconds,
+            "total_literature": total_seconds,
+        }
+        logger.info("Literature context assembly/other: %.2fs; literature total: %.2fs", other_seconds, total_seconds)
         return (context, diagnostics) if include_diagnostics else context
 
     # 2. Full-text indexing
@@ -1149,39 +1381,6 @@ class PlantBioRAG:
         va, vb = np.array(a, dtype=np.float32), np.array(b, dtype=np.float32)
         norm = np.linalg.norm(va) * np.linalg.norm(vb)
         return float(np.dot(va, vb) / norm) if norm else 0.0
-
-    # 4. Expand from seed chunks to nodes and chunks.
-    def _expand_hops(self, cids: List[str]):
-        # Fetch actual Triples (Node-Rel-Node)
-        query = """
-        MATCH (c1:Chunk) WHERE c1.chunk_id IN $cids
-        OPTIONAL MATCH (c1)-[:MENTIONS]->(n)
-        OPTIONAL MATCH (n)-[r]-(m) WHERE type(r) <> 'MENTIONS' 
-        AND n.id IS NOT NULL AND m.id IS NOT NULL  
-        OPTIONAL MATCH (m)<-[:MENTIONS]-(c2:Chunk) WHERE NOT c2.chunk_id IN $cids
-        RETURN
-            collect(DISTINCT c1 {.chunk_id, .source_path, .text}) AS seedchunks,
-            collect(DISTINCT c2 {.chunk_id, .source_path, .text}) AS expandedchunks,
-            collect(DISTINCT
-            CASE
-                WHEN r IS NULL THEN NULL
-                WHEN c2.source_path IS NULL OR c2.source_path = c1.source_path THEN
-                    {text: '[Source: ' + coalesce(c1.source_path, '') + '] ' + n.id + ' -[' + type(r) + ']-> ' + m.id,
-                     seed_chunk_id: c1.chunk_id,
-                     expanded_chunk_id: c2.chunk_id}
-                ELSE
-                    {text: '[Source: ' + coalesce(c1.source_path, '') + '; ' + coalesce(c2.source_path, '') + '] ' + n.id + ' -[' + type(r) + ']-> ' + m.id,
-                     seed_chunk_id: c1.chunk_id,
-                     expanded_chunk_id: c2.chunk_id}
-            END
-        ) AS triples
-        """
-        res = self.graph.query(query, params={"cids": cids})
-        if not res or not res[0]["seedchunks"]:
-            return [], [], []
-        # Ignore null rows and retain chunk provenance for evidence-based scores.
-        triples = [t for t in res[0]["triples"] if t is not None]
-        return res[0]["seedchunks"], res[0]["expandedchunks"], triples
 
     # Extracts plain text from an LLM response/chunk. `.content` is usually
     # a plain string, but some providers (e.g. Gemini) can return a list of
@@ -1256,7 +1455,7 @@ class PlantBioRAG:
 
     # Question analysis and retrieval query expansion
     def expand_question_and_queries(
-        self, q: str
+        self, q: str, diagnostics: Optional[dict] = None,
     ) -> tuple[str, list[str], bool, bool, list[str], str, str]:
         prompt = (
             getPrompt("expand_question_and_queries")
@@ -1266,9 +1465,17 @@ class PlantBioRAG:
         @@@@
         """
         )
+        if diagnostics is not None:
+            diagnostics.update({"model": GEMINI_MODEL, "temperature": 0,
+                                "prompt": prompt, "prompt_chars": len(prompt),
+                                "prompt_sha256": hashlib.sha256(prompt.encode("utf-8")).hexdigest()})
         resp = self._llm_invoke(prompt)
+        if diagnostics is not None:
+            diagnostics["raw_response"] = resp
         clean_json = resp.replace("```json", "").replace("```", "").strip()
         data = json.loads(clean_json)
+        if diagnostics is not None:
+            diagnostics["parsed_response"] = data
         expanded_question = str(data.get("expanded_question", q))
         expanded_queries = data.get("expanded_queries", [])
         expanded_question = (
@@ -1802,10 +2009,12 @@ Input JSON:
         max_context_chars: int,
         taxon_filter: Optional[dict[str, Any]] = None,
     ) -> Tuple[str, str, str, dict[str, Any]]:
+        source_errors = {}
         def safe_call(fn, label, *args):
             try:
                 return fn(*args)
             except Exception as e:
+                source_errors[label] = {"type": type(e).__name__, "message": str(e)}
                 logger.warning("%s context retrieval failed: %s", label, e)
                 return ""
 
@@ -1844,7 +2053,7 @@ Input JSON:
             metadata_context = metadata_future.result()
             pretzel_context = pretzel_future.result() if pretzel_future else ""
         return literature_context, metadata_context, pretzel_context, {
-            "literature": literature_diagnostics
+            "literature": literature_diagnostics, "source_errors": source_errors,
         }
 
     # Pure string assembly - no I/O, so nothing to catch here.
@@ -2076,7 +2285,9 @@ Input JSON:
                     direct_agg_accessions,
                     accession_question,
                     species,
-                ) = await asyncio.to_thread(self.expand_question_and_queries, q)
+                ) = await asyncio.to_thread(
+                    self.expand_question_and_queries, q
+                )
             except Exception as e:
                 logger.warning("Question and query expansion failed: %s", e)
                 expanded_question = q
@@ -2219,6 +2430,7 @@ Input JSON:
                     "Applying conservative crop/species filtering: %s",
                     taxon_filter["canonical_crops"],
                 )
+            start_time = time.perf_counter()
             (
                 literature_context,
                 metadata_context,
@@ -2239,7 +2451,7 @@ Input JSON:
                 "2. Concurrent retrieval: literature + metadata + Pretzel context: %.1f sec.",
                 end_time - start_time,
             )
-
+            retrieval_diagnostics.get("literature", {}).pop("run_trace", None)
             # Expose exactly what was retrieved from Neo4j and will be added
             # to the answer-generation prompt, so it can be inspected without
             # having to parse the prompt/answer itself.
@@ -2259,20 +2471,12 @@ Input JSON:
                 metadata_context,
                 pretzel_context,
             )
-            print("\n========== FINAL CONTEXT SENT TO THE ANSWER LLM ==========")
-            context_char_count = 0
-            for label, context in (
-                ("Literature", literature_context),
-                ("Metadata Graph", metadata_context),
-                ("Pretzel Documentation", pretzel_context),
-            ):
-                context = context or ""
-                context_char_count += len(context)
-                print(f"\n--- {label} ({len(context):,} characters) ---")
-                print(context if context else "[No context]")
-            print(f"\nTotal retrieved context: {context_char_count:,} characters")
-            print(f"Total answer prompt: {len(prompt):,} characters")
-            print("========== END FINAL CONTEXT ==========\n")
+            context_char_count = sum(len(context or "") for context in (
+                literature_context, metadata_context, pretzel_context
+            ))
+            logger.info("Retrieved context: %s chars; answer prompt: %s chars",
+                        f"{context_char_count:,}", f"{len(prompt):,}")
+
 
             state = state.model_copy(update={"stage": Stage.GENERATING_ANSWER})
             yield StageChangeEvent(state=state)
@@ -2442,7 +2646,6 @@ def main():
         return "".join(answer_parts), final_state
 
     answer, final_state = asyncio.run(_run())
-    logger.info("Final Answer:\n%s", answer)
     if final_state is not None:
         if final_state.error:
             logger.error("Run error: %s", final_state.error)
