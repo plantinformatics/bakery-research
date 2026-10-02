@@ -298,6 +298,7 @@ LITERATURE_CONTEXT_CHARS_STEP = 10000
 MAX_TRIPLES = 50
 LITERATURE_TRIPLE_MAX_CHARACTERS = 5000  # Separate budget for literature relationships.
 RERANK_MAX_TEXT_CHARS = 1500  # Passage excerpt sent to the semantic evidence judge.
+LITERATURE_EXPANSION_SCORE_DISCOUNT = 0.5  # One-hop graph matches borrow only part of their originating chunk's RRF score.
 RERANK_CANDIDATES_PER_QUERY = 3  # Preserve candidates from each generated query.
 RERANK_BATCH_SIZE = 16  # Batch size for the extra semantic-ranking calls.
 RERANK_MAX_CONCURRENT_BATCHES = 3  # Independent judge calls in flight; lower if API rate-limited.
@@ -306,7 +307,7 @@ RERANK_MAX_METADATA_CHARS = 3000  # Metadata scope shown to the evidence judge.
 RERANK_MODEL = "gemini-2.5-flash"  # Lower-cost model used only for literature relevance scoring.
 
 # USER ADJUSTABLE VARIABLES 
-LITERATURE_CHUNKS_TO_RERANK = 80  # Maximum literature chunks sent to relevance ranking per request.
+LITERATURE_CHUNKS_TO_RERANK = 100  # Maximum literature chunks sent to relevance ranking per request.
 MAX_CHARACTERS = 50000  # The final size of the literature context sent to the LLM.
 
 # Accession API config
@@ -680,6 +681,7 @@ class PlantBioRAG:
                 "query": expanded_query,
                 "per_query_rrf_score": item.get("rrf_score"),
                 "first_query_rejection_reason": item.get("rejection_reason"),
+                "is_direct_search_match": cid in fused,
                 "is_seed": cid in seed_cids,
                 "is_expanded_chunk": cid in expanded_chunk_ids,
                 "expanded_from_seed_ids": sorted(seed_ids_by_expanded_chunk.get(cid, ())),
@@ -1062,6 +1064,29 @@ class PlantBioRAG:
             lexical_seconds, vector_timings.get("question_embedding", 0.0),
             vector_timings.get("neo4j_cosine", 0.0), vector_scored_count,
         )
+        for item in all_chunks:
+            paths = item.get("retrieval_queries", [])
+            has_direct = any(path.get("is_direct_search_match") for path in paths)
+            has_expanded = any(path.get("is_expanded_chunk") for path in paths)
+            item["retrieval_origin"] = (
+                "direct_and_expanded" if has_direct and has_expanded else
+                "direct" if has_direct else "expanded" if has_expanded else "other"
+            )
+            vector_similarity = max(0.0, min(1.0, item.get("retrieval_vector_similarity") or 0.0))
+            lexical_score = max(0.0, item.get("retrieval_lexical_score") or 0.0)
+            own_match = max(vector_similarity, lexical_score / (1.0 + lexical_score))
+            expanded_multiplier = LITERATURE_EXPANSION_SCORE_DISCOUNT * (0.5 + 0.5 * own_match)
+            query_scores = {}
+            for path in paths:
+                if path.get("first_query_rejection_reason") is not None:
+                    continue
+                score = path.get("per_query_rrf_score") or 0.0
+                if not path.get("is_direct_search_match"):
+                    score *= expanded_multiplier
+                path["per_query_candidate_score"] = score
+                query = path["query"]
+                query_scores[query] = max(query_scores.get(query, 0.0), score)
+            item["candidate_score"] = sum(query_scores.values())
         pool_started = time.perf_counter()
         rrf_ranked = sorted(
             all_chunks,
@@ -1069,6 +1094,12 @@ class PlantBioRAG:
         )
         for rank, item in enumerate(rrf_ranked, start=1):
             item["rrf_rank"] = rank
+        candidate_ranked = sorted(
+            all_chunks,
+            key=lambda item: literature_candidate_sort_key(item, item.get("candidate_score")),
+        )
+        for rank, item in enumerate(candidate_ranked, start=1):
+            item["candidate_rank"] = rank
             item["rrf_eligible_query_contributions"] = dict(item.get("_query_scores", {}))
             item["text_chars"] = len(item.get("text", ""))
             item["text_sha256"] = hashlib.sha256(item.get("text", "").encode("utf-8")).hexdigest()
@@ -1083,15 +1114,23 @@ class PlantBioRAG:
         pool_ids = set()
         for query in expanded_queries:
             query_ranked = sorted(
-                (item for item in eligible_chunks if query in item.get("_query_scores", {})),
-                key=lambda item: literature_candidate_sort_key(item, item["_query_scores"][query]),
+                (item for item in eligible_chunks if any(
+                    path.get("query") == query and path.get("per_query_candidate_score") is not None
+                    for path in item.get("retrieval_queries", [])
+                )),
+                key=lambda item: literature_candidate_sort_key(
+                    item, max(
+                        path["per_query_candidate_score"] for path in item["retrieval_queries"]
+                        if path.get("query") == query and path.get("per_query_candidate_score") is not None
+                    ),
+                ),
             )
             for item in query_ranked[:RERANK_CANDIDATES_PER_QUERY]:
                 identity = item.get("chunk_id") or id(item)
                 if identity not in pool_ids and len(rerank_pool) < LITERATURE_CHUNKS_TO_RERANK:
                     pool_ids.add(identity)
                     rerank_pool.append(item)
-        for item in rrf_ranked:
+        for item in candidate_ranked:
             if len(rerank_pool) >= LITERATURE_CHUNKS_TO_RERANK:
                 break
             identity = item.get("chunk_id") or id(item)
@@ -1113,7 +1152,7 @@ class PlantBioRAG:
                 result = rerank_results[str(item.get("chunk_id") or id(item))]
                 item.update(result)
         except Exception as error:
-            logger.warning("Literature semantic reranking failed; using RRF order: %s", error)
+            logger.warning("Literature semantic reranking failed; using candidate order: %s", error)
             reranker_error = str(error)
             rerank_pool = eligible_chunks
             for item in eligible_chunks:
@@ -1130,7 +1169,7 @@ class PlantBioRAG:
             rerank_pool,
             key=lambda item: (
                 item.get("semantic_score") if semantic_available else 0.0,
-                item.get("rrf_score") or 0.0,
+                item.get("candidate_score") or 0.0,
                 -len(item.get("text", "")),
             ),
             reverse=True,
@@ -1221,6 +1260,7 @@ class PlantBioRAG:
                 "expanded_queries_in_input_order": expanded_queries,
                 "query_completion_order": completion_order,
                 "combined_rrf_ids_in_rank_order": [item.get("chunk_id") for item in rrf_ranked],
+                "candidate_ids_in_rank_order": [item.get("chunk_id") for item in candidate_ranked],
                 "combined_rrf_ties": [
                     {"score": score, "chunk_ids_in_rank_order": ids}
                     for score, ids in combined_rrf_groups.items() if len(ids) > 1
@@ -1232,6 +1272,7 @@ class PlantBioRAG:
                 "metadata_scope_truncated": len(metadata_context) > RERANK_MAX_METADATA_CHARS,
                 "rrf_aggregation_rule": "Sum per-query RRF only for eligible branches; otherwise retain maximum rejected-branch score. Expanded chunks inherit the maximum originating seed score per query.",
                 "rrf_tie_rule": "Equal RRF scores use each chunk's vector similarity to the question, then question-term overlap, direct-search status, and chunk ID.",
+                "candidate_ranking_rule": "Direct matches keep their own per-query RRF. Expansion-only matches use the originating RRF times the expansion discount and their own vector/lexical match. Eligible per-query candidate scores are summed before the judge pool is selected.",
                 "vector_tie_break_scored_count": vector_scored_count,
                 "vector_tie_break_error": vector_tie_break_error,
                 "budget_tie_rule": "Equal utility-per-character choices retain ranked-pool order.",
@@ -2646,6 +2687,7 @@ def main():
         return "".join(answer_parts), final_state
 
     answer, final_state = asyncio.run(_run())
+    logger.info("Final Answer:\n%s", answer)
     if final_state is not None:
         if final_state.error:
             logger.error("Run error: %s", final_state.error)
