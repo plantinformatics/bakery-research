@@ -2496,6 +2496,10 @@ Input JSON:
         token_tally: list[dict] = []
         query_started = time.perf_counter()
         try:
+            # Announce EXPANDING_QUESTION before the analysis LLM call, so the
+            # frontend shows it while it runs (and drops the previous run's state).
+            yield StageChangeEvent(state=state)
+
             # Classify before cache/retrieval so a direct AGG lookup can skip
             # GraphRAG when no suitable cached response exists.
             expansion_diagnostics: dict = {}

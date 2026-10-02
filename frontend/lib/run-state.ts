@@ -53,7 +53,7 @@ export type TokenUsageTally = {
 export const STAGE_LABELS: Record<PipelineStage, string> = {
   expanding_question: "Expanding question",
   retrieving_context: "Retrieving context",
-  judging_relevance: "Judging relevance",
+  judging_relevance: "Judging context relevance",
   generating_answer: "Generating answer",
   checking_agg_accessions: "Checking accessions",
   presenting_accessions: "Presenting accessions",
