@@ -65,12 +65,24 @@ useCache = os.getenv("USE_CACHE") or False
 
 warnings.simplefilter("ignore", DeprecationWarning)
 
+# Plain one-line-per-record log file next to this module (append mode), alongside
+# the coloured console output. Rich formatting would wrap lines and drop
+# timestamps in a file, so the file gets the original plain format.
+query_log_handler = logging.FileHandler(
+    Path(__file__).resolve().parent / "query.log", mode="a", encoding="utf-8"
+)
+query_log_handler.setFormatter(
+    logging.Formatter("%(asctime)s %(levelname)s %(name)s - %(message)s")
+)
 logging.basicConfig(
     level=logging.INFO,
     format="%(name)s - %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
     # markup=False so bracketed labels like "[original]" aren't parsed as Rich markup.
-    handlers=[RichHandler(rich_tracebacks=True, markup=False, show_path=False)],
+    handlers=[
+        RichHandler(rich_tracebacks=True, markup=False, show_path=False),
+        query_log_handler,
+    ],
 )
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("google_genai").setLevel(logging.WARNING)
