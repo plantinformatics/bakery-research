@@ -18,6 +18,7 @@ import {
   stageLabel,
   type PipelineStage,
   type PlantBioRunState,
+  type TokenUsageTally,
 } from "@/lib/run-state";
 
 const RETRIEVED_CONTEXT_SECTIONS: Array<{
@@ -28,6 +29,32 @@ const RETRIEVED_CONTEXT_SECTIONS: Array<{
   { key: "metadata_context", label: "Metadata graph" },
   { key: "pretzel_context", label: "Pretzel documentation" },
 ];
+
+function TokenUsageBreakdown({ tally }: { tally: TokenUsageTally }) {
+  const [open, setOpen] = useState(false);
+  const totalLabel = formatTokenUsage(tally.total);
+  const steps = tally.by_step ?? [];
+  if (!totalLabel) return null;
+
+  return (
+    <Collapsible open={open} onOpenChange={setOpen}>
+      <CollapsibleTrigger className="text-muted-foreground hover:text-foreground text-left text-xs underline decoration-dotted underline-offset-2">
+        Tokens (whole run): {totalLabel}
+      </CollapsibleTrigger>
+      <CollapsibleContent className="mt-1">
+        <ul className="text-muted-foreground flex flex-col gap-0.5 text-[11px]">
+          {steps.map((entry, index) => (
+            <li key={`${entry.step}-${index}`}>
+              {entry.step}
+              {entry.model ? ` (${entry.model})` : ""}:{" "}
+              {formatTokenUsage(entry) ?? "not reported"}
+            </li>
+          ))}
+        </ul>
+      </CollapsibleContent>
+    </Collapsible>
+  );
+}
 
 function RetrievedContext({ state }: { state: PlantBioRunState }) {
   const [open, setOpen] = useState(false);
@@ -97,6 +124,11 @@ export function PipelineStatus() {
     console.info("Token usage:", usageLabel, state.usage_metadata);
   }, [usageLabel, state?.usage_metadata]);
 
+  useEffect(() => {
+    if (!state?.token_usage?.total) return;
+    console.info("Token usage (whole run):", state.token_usage);
+  }, [state?.token_usage]);
+
   if (!isRunning && !state?.stage) {
     return null;
   }
@@ -157,7 +189,9 @@ export function PipelineStatus() {
           })}
         </ol>
 
-        {usageLabel ? (
+        {state?.token_usage?.total ? (
+          <TokenUsageBreakdown tally={state.token_usage} />
+        ) : usageLabel ? (
           <p className="text-muted-foreground text-xs">Tokens: {usageLabel}</p>
         ) : null}
 
