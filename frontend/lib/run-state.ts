@@ -3,6 +3,7 @@
 export const PIPELINE_STAGES = [
   "expanding_question",
   "retrieving_context",
+  "judging_relevance",
   "generating_answer",
   "checking_agg_accessions",
   "presenting_accessions",
@@ -13,6 +14,9 @@ export type PipelineStage = (typeof PIPELINE_STAGES)[number];
 export type PlantBioRunState = {
   stage?: PipelineStage | string;
   expanded_question?: string | null;
+  /** Queries used for retrieval: the original question first, then the
+   * deduplicated expansions. Empty for cache hits and direct AGG lookups. */
+  retrieval_queries?: string[];
   /** Answer-generation model/reasoning level actually used for this run
    * (after `Query.py`'s fallback resolution), echoed back so the frontend
    * can confirm the `ModelSelector` choice took effect. */
@@ -49,6 +53,7 @@ export type TokenUsageTally = {
 export const STAGE_LABELS: Record<PipelineStage, string> = {
   expanding_question: "Expanding question",
   retrieving_context: "Retrieving context",
+  judging_relevance: "Judging context relevance",
   generating_answer: "Generating answer",
   checking_agg_accessions: "Checking accessions",
   presenting_accessions: "Presenting accessions",
