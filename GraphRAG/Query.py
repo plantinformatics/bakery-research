@@ -23,8 +23,10 @@ from enum import Enum
 from pydantic import BaseModel, Field
 import numpy as np
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from contextlib import contextmanager
 from threading import local
 from dotenv import load_dotenv
+from rich.logging import RichHandler
 
 from getPrompt import getPrompt
 from literature_graph_expansion import expand_literature_graph
@@ -64,7 +66,11 @@ useCache = os.getenv("USE_CACHE") or False
 warnings.simplefilter("ignore", DeprecationWarning)
 
 logging.basicConfig(
-    level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s - %(message)s"
+    level=logging.INFO,
+    format="%(name)s - %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+    # markup=False so bracketed labels like "[original]" aren't parsed as Rich markup.
+    handlers=[RichHandler(rich_tracebacks=True, markup=False, show_path=False)],
 )
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("google_genai").setLevel(logging.WARNING)
@@ -77,6 +83,90 @@ logging.getLogger("neo4j.notifications").setLevel(
     logging.ERROR
 )  # comment out in future if fixed upstream
 logger = logging.getLogger(__name__)
+# Set LOG_LEVEL=DEBUG to see per-stage diagnostics from this module only.
+logger.setLevel(os.getenv("LOG_LEVEL", "INFO").upper())
+
+
+@contextmanager
+def log_step(
+    name: str,
+    number: Optional[Union[int, str]] = None,
+    token_tally: Optional[list] = None,
+):
+    """Log '<n>. <name> Started' / '<name> Ended: X sec.' around a pipeline step.
+
+    Set step["model"] and step["usage"] (a usage_metadata dict) inside the block
+    to also log the tokens used; they are appended to `token_tally` when given.
+    """
+    step: dict[str, Any] = {"model": None, "usage": None}
+    logger.info("%s%s Started", f"{number}. " if number is not None else "", name)
+    started = time.perf_counter()
+    status = "Ended"
+    try:
+        yield step
+    except Exception:
+        status = "Failed"
+        raise
+    except BaseException:
+        status = "Cancelled"
+        raise
+    finally:
+        logger.info("%s %s: %.1f sec.", name, status, time.perf_counter() - started)
+        if step["usage"]:
+            logger.info(
+                "Tokens used (%s): %s",
+                step["model"] or "unknown model",
+                step["usage"],
+            )
+            if token_tally is not None:
+                token_tally.append(
+                    _token_tally_entry(name, step["model"], step["usage"])
+                )
+
+
+def _token_tally_entry(step_name: str, model: Optional[str], usage: dict) -> dict:
+    """One per-step row of RunState.token_usage["by_step"]."""
+    reasoning = (usage.get("output_token_details") or {}).get("reasoning")
+    entry = {
+        "step": step_name,
+        "model": model,
+        "input_tokens": usage.get("input_tokens") or 0,
+        "output_tokens": usage.get("output_tokens") or 0,
+        "total_tokens": usage.get("total_tokens") or 0,
+    }
+    if reasoning:
+        entry["output_token_details"] = {"reasoning": reasoning}
+    return entry
+
+
+def summarise_token_tally(
+    token_tally: list, elapsed_seconds: Optional[float] = None
+) -> dict:
+    """Sum per-step token usage into RunState.token_usage and log the run total."""
+    total = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
+    reasoning = 0
+    for entry in token_tally:
+        for key in total:
+            total[key] += entry.get(key) or 0
+        reasoning += (entry.get("output_token_details") or {}).get("reasoning") or 0
+    if reasoning:
+        total["output_token_details"] = {"reasoning": reasoning}
+    logger.info("─" * 60)
+    logger.info(
+        "End Query - total usage%s: %s",
+        f" ({elapsed_seconds:.1f} sec.)" if elapsed_seconds is not None else "",
+        total,
+    )
+    # Per-step lines were already logged by log_step; repeat them only at DEBUG.
+    for entry in token_tally:
+        logger.debug(
+            "    %s (%s): %s",
+            entry["step"],
+            entry["model"] or "unknown model",
+            {k: v for k, v in entry.items() if k not in ("step", "model")},
+        )
+    return {"total": total, "by_step": list(token_tally)}
+
 
 GEMINI_EMBEDDING_MODEL = "models/gemini-embedding-001"
 
@@ -355,6 +445,8 @@ class RunState(BaseModel):
     needs_clarification: bool = False
     accessions: List[str] = Field(default_factory=list)
     usage_metadata: dict = Field(default_factory=dict)
+    # Run-wide tally of every LLM call: {"total": usage, "by_step": [{step, model, ...usage}]}.
+    token_usage: dict = Field(default_factory=dict)
     # Raw context strings retrieved from Neo4j and injected into the
     # answer-generation prompt by `_build_answer_prompt` (see there for the
     # exact `### [Source: ...]` framing each is wrapped in). Exposed here so
@@ -592,7 +684,9 @@ class PlantBioRAG:
         k: int,
         original_question: str,
         taxon_filter: Optional[dict[str, Any]] = None,
+        query_label: str = "query",
     ) -> dict:
+        query_started = time.perf_counter()
         search_trace = {}
         fused = self._hybrid_scores_concurrent(
             expanded_query, self._vector_chunks, self._fulltext_chunks, k,
@@ -616,10 +710,18 @@ class PlantBioRAG:
         eligible_ranked_cids = [cid for cid in ranked_cids if cid not in taxonomy_rejected_ids]
         seed_cids = eligible_ranked_cids[:k]
         outside_top_k_ids = eligible_ranked_cids[k:]
+        hybrid_search_seconds = time.perf_counter() - query_started
         seeded_chunks, expanded_chunks, triples, expansion_timings = expand_literature_graph(
             self.graph, seed_cids, [candidate_by_id[cid] for cid in seed_cids if cid in candidate_by_id]
         )
-        logger.info("Literature graph expansion [%s]: %.2fs", expanded_query, expansion_timings["total_seconds"])
+        logger.debug(
+            'Literature query [%s] "%s": %.2fs = hybrid search %.2fs (%d seeds) + graph neighbours %.2fs (%d neighbour chunks, %d triples)',
+            query_label, expanded_query,
+            hybrid_search_seconds + expansion_timings["total_seconds"],
+            hybrid_search_seconds, expansion_timings.get("seed_count", 0),
+            expansion_timings["total_seconds"], expansion_timings.get("neighbor_count", 0),
+            expansion_timings.get("triple_count", 0),
+        )
         search_trace["graph_expansion"] = expansion_timings
         postprocess_started = time.perf_counter()
         all_chunks = self._dedupe_chunks(seeded_chunks + expanded_chunks)
@@ -730,8 +832,8 @@ class PlantBioRAG:
         }
         search_trace["post_expansion_processing"] = postprocess_timings
         logger.debug(
-            "Literature post-expansion [%s]: %.2fs (provenance index %.2fs, candidates %.2fs, relationship dedup %.2fs)",
-            expanded_query, postprocess_timings["total_seconds"],
+            'Literature post-expansion [%s] "%s": %.2fs (provenance index %.2fs, candidates %.2fs, relationship dedup %.2fs)',
+            query_label, expanded_query, postprocess_timings["total_seconds"],
             postprocess_timings["provenance_index_seconds"],
             postprocess_timings["candidate_build_seconds"],
             postprocess_timings["relationship_dedup_seconds"],
@@ -973,7 +1075,12 @@ class PlantBioRAG:
                     k,
                     relevance_question,
                     taxon_filter,
-                ): query for query in expanded_queries
+                    query_label=(
+                        "original" if index == 0 and original_question
+                        and " ".join(query.split()).casefold() == " ".join(original_question.split()).casefold()
+                        else f"expanded {index}/{len(expanded_queries) - 1}"
+                    ),
+                ): query for index, query in enumerate(expanded_queries)
             }
             for future in as_completed(futures):
                 query = futures[future]
@@ -1037,7 +1144,10 @@ class PlantBioRAG:
                 result["diagnostics"]["triples"] = []
 
         search_seconds = time.perf_counter() - literature_started
-        logger.info("Literature hybrid retrieval + graph expansion: %.2fs", search_seconds)
+        logger.info(
+            "Literature retrieval, %d %s in parallel: %.2fs wall",
+            len(expanded_queries), "query" if len(expanded_queries) == 1 else "queries", search_seconds,
+        )
         metadata_wait_started = time.perf_counter()
         metadata_context = metadata_context_future.result() if metadata_context_future else ""
         metadata_wait_seconds = time.perf_counter() - metadata_wait_started
@@ -1405,8 +1515,10 @@ class PlantBioRAG:
             return "".join(pieces)
         return str(content) if content else str(resp)
 
-    def _llm_invoke(self, prompt: Any) -> str:
+    def _llm_invoke(self, prompt: Any, diagnostics: Optional[dict] = None) -> str:
         resp = self.llm.invoke(prompt)
+        if diagnostics is not None:
+            diagnostics["usage_metadata"] = getattr(resp, "usage_metadata", None) or {}
         return self._message_text(resp).strip()
 
     # Extracts the model's thinking/reasoning-trace text from a response or
@@ -1469,7 +1581,7 @@ class PlantBioRAG:
             diagnostics.update({"model": GEMINI_MODEL, "temperature": 0,
                                 "prompt": prompt, "prompt_chars": len(prompt),
                                 "prompt_sha256": hashlib.sha256(prompt.encode("utf-8")).hexdigest()})
-        resp = self._llm_invoke(prompt)
+        resp = self._llm_invoke(prompt, diagnostics)
         if diagnostics is not None:
             diagnostics["raw_response"] = resp
         clean_json = resp.replace("```json", "").replace("```", "").strip()
@@ -1488,8 +1600,15 @@ class PlantBioRAG:
         ]
         # Always include original user question first for exact-match retrieval
         expanded_queries.insert(0, q)
-        # De-duplicate while preserving order
-        expanded_queries = list(dict.fromkeys(expanded_queries))
+        # De-duplicate while preserving order (case/whitespace/trailing-punctuation-insensitive)
+        seen_query_keys = set()
+        deduplicated_queries = []
+        for s in expanded_queries:
+            key = " ".join(s.split()).casefold().rstrip("?.! ")
+            if key not in seen_query_keys:
+                seen_query_keys.add(key)
+                deduplicated_queries.append(s)
+        expanded_queries = deduplicated_queries
         is_agg_accession_query = bool(data.get("is_agg_accession_query", False))
         is_direct_agg_lookup = bool(data.get("is_direct_agg_lookup", False))
         raw_direct_accessions = data.get("direct_agg_accessions", [])
@@ -1520,7 +1639,8 @@ class PlantBioRAG:
         )
 
     def _extract_accessions(
-        self, question: str, answer: str, species: str
+        self, question: str, answer: str, species: str,
+        diagnostics: Optional[dict] = None,
     ) -> List[str]:
         """Extract only relevant accessions in one LLM call."""
         payload = json.dumps(
@@ -1534,7 +1654,7 @@ Input JSON:
 """
             + payload
         )
-        raw = self._llm_invoke(prompt).strip()
+        raw = self._llm_invoke(prompt, diagnostics).strip()
         raw = re.sub(r"^```(?:json)?\s*", "", raw)
         raw = re.sub(r"\s*```$", "", raw)
         try:
@@ -1618,7 +1738,8 @@ Input JSON:
 
     # Use LLM to present accession API response clearly to the user
     def _present_accession_results(
-        self, original_question: str, api_response: dict
+        self, original_question: str, api_response: dict,
+        diagnostics: Optional[dict] = None,
     ) -> str:
         prompt = (
             getPrompt("present_accession_results")
@@ -1631,7 +1752,7 @@ Input JSON:
         {api_response}
         """
         )
-        resp = self._llm_invoke(prompt)
+        resp = self._llm_invoke(prompt, diagnostics)
         return resp
 
     # 2. Metadata Graph RAG
@@ -2183,23 +2304,23 @@ Input JSON:
     # `_call_accession_api` already degrades to `None` internally on
     # network/HTTP errors, so it's safe to call directly here.
     def _lookup_agg_accessions(
-        self, q: str, answer: str, species: str, accession_question: str
+        self, q: str, answer: str, species: str, accession_question: str,
+        token_tally: Optional[list] = None,
     ) -> Tuple[List[str], Optional[dict]]:
         logger.info(
             "[AGG Accession Query Detected] Extracting accessions from RAG answer..."
         )
-        start_time = time.perf_counter()
-        accessions = self._extract_accessions(q, answer, species)
-        end_time = time.perf_counter()
-        logger.info("6. Extract relevant accessions: %.1f sec.", end_time - start_time)
+        extraction_diagnostics: dict = {}
+        with log_step("Extract relevant accessions", 6, token_tally) as step:
+            accessions = self._extract_accessions(q, answer, species, extraction_diagnostics)
+            step["model"] = GEMINI_MODEL
+            step["usage"] = extraction_diagnostics.get("usage_metadata")
         logger.info("[Relevant Accessions]: %s", accessions)
 
         api_response = None
         if accessions:
-            start_time = time.perf_counter()
-            api_response = self._call_accession_api(accession_question, accessions)
-            end_time = time.perf_counter()
-            logger.info(f"7. Call accession API: {end_time - start_time:0.1f} sec.")
+            with log_step("Call accession API", 7):
+                api_response = self._call_accession_api(accession_question, accessions)
             logger.info(f"api_response: {api_response}")
         return accessions, api_response
 
@@ -2272,33 +2393,37 @@ Input JSON:
             reasoning_level=resolved_reasoning_level,
             max_context_chars=max_context_chars,
         )
+        # Every LLM call's usage for this run; summarised into state.token_usage at the end.
+        token_tally: list[dict] = []
+        query_started = time.perf_counter()
         try:
             # Classify before cache/retrieval so a direct AGG lookup can skip
             # GraphRAG when no suitable cached response exists.
-            start_time = time.perf_counter()
-            try:
-                (
-                    expanded_question,
-                    expanded_queries,
-                    is_agg_accession_query,
-                    is_direct_agg_lookup,
-                    direct_agg_accessions,
-                    accession_question,
-                    species,
-                ) = await asyncio.to_thread(
-                    self.expand_question_and_queries, q
-                )
-            except Exception as e:
-                logger.warning("Question and query expansion failed: %s", e)
-                expanded_question = q
-                expanded_queries = [q]
-                is_agg_accession_query = False
-                is_direct_agg_lookup = False
-                direct_agg_accessions = []
-                accession_question = ""
-                species = ""
-            end_time = time.perf_counter()
-            logger.info(f"1. Analysis of question: {end_time - start_time:0.1f} sec.")
+            expansion_diagnostics: dict = {}
+            with log_step("Analysis of question", 1, token_tally) as step:
+                try:
+                    (
+                        expanded_question,
+                        expanded_queries,
+                        is_agg_accession_query,
+                        is_direct_agg_lookup,
+                        direct_agg_accessions,
+                        accession_question,
+                        species,
+                    ) = await asyncio.to_thread(
+                        self.expand_question_and_queries, q, expansion_diagnostics
+                    )
+                except Exception as e:
+                    logger.warning("Question and query expansion failed: %s", e)
+                    expanded_question = q
+                    expanded_queries = [q]
+                    is_agg_accession_query = False
+                    is_direct_agg_lookup = False
+                    direct_agg_accessions = []
+                    accession_question = ""
+                    species = ""
+                step["model"] = expansion_diagnostics.get("model")
+                step["usage"] = expansion_diagnostics.get("usage_metadata")
 
             state = state.model_copy(
                 update={
@@ -2312,13 +2437,9 @@ Input JSON:
             cached = None
             q_emb = None
             if useCache:
-                start_time = time.perf_counter()
-                q_emb = await asyncio.to_thread(self.emb.embed_query, q)
-                cached = await asyncio.to_thread(self._semantic_cache_lookup, q_emb)
-                end_time = time.perf_counter()
-                logger.info(
-                    f"0. Semantic cache lookup: {end_time - start_time:0.1f} sec."
-                )
+                with log_step("Semantic cache lookup", 0):
+                    q_emb = await asyncio.to_thread(self.emb.embed_query, q)
+                    cached = await asyncio.to_thread(self._semantic_cache_lookup, q_emb)
 
             if cached:
                 cached_expanded_question, cached_answer, _cached_usage = cached
@@ -2332,30 +2453,25 @@ Input JSON:
 
                 prompt = self._build_cached_answer_prompt(q, cached_answer)
 
-                start_time = time.perf_counter()
-                answer_parts = []
-                full_chunk = None
-                async for chunk in self._generate_answer_stream(
-                    prompt, resolved_model_name, resolved_reasoning_level
-                ):
-                    full_chunk = chunk if full_chunk is None else full_chunk + chunk
-                    thinking = self._message_thinking(chunk)
-                    if thinking:
-                        yield ReasoningEvent(text=thinking)
-                    text = self._message_text(chunk)
-                    if text:
-                        answer_parts.append(text)
-                        yield TextEvent(text=text)
-                end_time = time.perf_counter()
-                logger.info(
-                    "4. Use LLM and previous cached answer to answer: %.1f sec.",
-                    end_time - start_time,
-                )
-
-                usage_metadata = getattr(full_chunk, "usage_metadata", {}) or {}
-                logger.info("Token usage: %s", usage_metadata)
+                with log_step("Use LLM and previous cached answer to answer", 4, token_tally) as step:
+                    answer_parts = []
+                    full_chunk = None
+                    async for chunk in self._generate_answer_stream(
+                        prompt, resolved_model_name, resolved_reasoning_level
+                    ):
+                        full_chunk = chunk if full_chunk is None else full_chunk + chunk
+                        thinking = self._message_thinking(chunk)
+                        if thinking:
+                            yield ReasoningEvent(text=thinking)
+                        text = self._message_text(chunk)
+                        if text:
+                            answer_parts.append(text)
+                            yield TextEvent(text=text)
+                    usage_metadata = getattr(full_chunk, "usage_metadata", {}) or {}
+                    step["model"] = resolved_model_name
+                    step["usage"] = usage_metadata
                 state = state.model_copy(update={"usage_metadata": usage_metadata})
-                yield ResultEvent(state=state)
+                yield ResultEvent(state=state.model_copy(update={"token_usage": summarise_token_tally(token_tally, time.perf_counter() - query_started)}))
                 return
 
             if is_direct_agg_lookup:
@@ -2392,10 +2508,17 @@ Input JSON:
                         update={"stage": Stage.PRESENTING_ACCESSIONS}
                     )
                     yield StageChangeEvent(state=state)
+                    presentation_diagnostics: dict = {}
                     try:
                         direct_answer = await asyncio.to_thread(
-                            self._present_accession_results, q, api_response
+                            self._present_accession_results, q, api_response,
+                            presentation_diagnostics,
                         )
+                        if presentation_diagnostics.get("usage_metadata"):
+                            token_tally.append(_token_tally_entry(
+                                "Summarise and present accession results", GEMINI_MODEL,
+                                presentation_diagnostics["usage_metadata"],
+                            ))
                     except Exception as e:
                         logger.exception("Presenting direct AGG results failed: %s", e)
                         direct_answer = (
@@ -2414,44 +2537,46 @@ Input JSON:
                         )
 
                 yield TextEvent(text=direct_answer)
-                yield ResultEvent(state=state)
+                yield ResultEvent(state=state.model_copy(update={"token_usage": summarise_token_tally(token_tally, time.perf_counter() - query_started)}))
                 return
 
             state = state.model_copy(update={"stage": Stage.RETRIEVING_CONTEXT})
             yield StageChangeEvent(state=state)
 
             # Run literature, metadata, and Pretzel context retrieval concurrently.
-            start_time = time.perf_counter()
-            taxon_filter = (
-                resolve_taxon_filter(q, species) if SPECIES_FILTER_ENABLED else None
-            )
-            if taxon_filter:
-                logger.info(
-                    "Applying conservative crop/species filtering: %s",
-                    taxon_filter["canonical_crops"],
+            with log_step("Concurrent retrieval: literature + metadata + Pretzel context", 2):
+                taxon_filter = (
+                    resolve_taxon_filter(q, species) if SPECIES_FILTER_ENABLED else None
                 )
-            start_time = time.perf_counter()
-            (
-                literature_context,
-                metadata_context,
-                pretzel_context,
-                retrieval_diagnostics,
-            ) = (
-                await asyncio.to_thread(
-                    self._retrieve_context,
-                    q,
-                    expanded_queries,
-                    k,
-                    max_context_chars,
-                    taxon_filter,
+                if taxon_filter:
+                    logger.info(
+                        "Applying conservative crop/species filtering: %s",
+                        taxon_filter["canonical_crops"],
+                    )
+                (
+                    literature_context,
+                    metadata_context,
+                    pretzel_context,
+                    retrieval_diagnostics,
+                ) = (
+                    await asyncio.to_thread(
+                        self._retrieve_context,
+                        q,
+                        expanded_queries,
+                        k,
+                        max_context_chars,
+                        taxon_filter,
+                    )
                 )
-            )
-            end_time = time.perf_counter()
-            logger.info(
-                "2. Concurrent retrieval: literature + metadata + Pretzel context: %.1f sec.",
-                end_time - start_time,
-            )
             retrieval_diagnostics.get("literature", {}).pop("run_trace", None)
+            reranker_usage = (
+                retrieval_diagnostics.get("literature", {})
+                .get("chunk_reranker", {}).get("token_usage") or {}
+            )
+            if reranker_usage.get("calls"):
+                token_tally.append(_token_tally_entry(
+                    "Literature relevance judge", reranker_usage.get("model"), reranker_usage,
+                ))
             # Expose exactly what was retrieved from Neo4j and will be added
             # to the answer-generation prompt, so it can be inspected without
             # having to parse the prompt/answer itself.
@@ -2481,26 +2606,25 @@ Input JSON:
             state = state.model_copy(update={"stage": Stage.GENERATING_ANSWER})
             yield StageChangeEvent(state=state)
 
-            start_time = time.perf_counter()
-            answer_parts = []
-            full_chunk = None
-            async for chunk in self._generate_answer_stream(
-                prompt, resolved_model_name, resolved_reasoning_level
-            ):
-                full_chunk = chunk if full_chunk is None else full_chunk + chunk
-                thinking = self._message_thinking(chunk)
-                if thinking:
-                    yield ReasoningEvent(text=thinking)
-                text = self._message_text(chunk)
-                if text:
-                    answer_parts.append(text)
-                    yield TextEvent(text=text)
-            end_time = time.perf_counter()
-            logger.info(f"4. Call LLM to answer: {end_time - start_time:0.1f} sec.")
+            with log_step("Call LLM to answer", 4, token_tally) as step:
+                answer_parts = []
+                full_chunk = None
+                async for chunk in self._generate_answer_stream(
+                    prompt, resolved_model_name, resolved_reasoning_level
+                ):
+                    full_chunk = chunk if full_chunk is None else full_chunk + chunk
+                    thinking = self._message_thinking(chunk)
+                    if thinking:
+                        yield ReasoningEvent(text=thinking)
+                    text = self._message_text(chunk)
+                    if text:
+                        answer_parts.append(text)
+                        yield TextEvent(text=text)
+                usage_metadata = getattr(full_chunk, "usage_metadata", {}) or {}
+                step["model"] = resolved_model_name
+                step["usage"] = usage_metadata
 
             answer = "".join(answer_parts).strip()
-            usage_metadata = getattr(full_chunk, "usage_metadata", {}) or {}
-            logger.info("Token usage: %s", usage_metadata)
             state = state.model_copy(update={"usage_metadata": usage_metadata})
             full_answer = answer
 
@@ -2521,7 +2645,7 @@ Input JSON:
                         usage_metadata,
                         q_emb,
                     )
-                yield ResultEvent(state=state)
+                yield ResultEvent(state=state.model_copy(update={"token_usage": summarise_token_tally(token_tally, time.perf_counter() - query_started)}))
                 return
 
             if is_agg_accession_query:
@@ -2537,6 +2661,7 @@ Input JSON:
                         answer,
                         species,
                         accession_question,
+                        token_tally,
                     )
                 except Exception as e:
                     logger.exception("AGG accession lookup failed: %s", e)
@@ -2555,20 +2680,20 @@ Input JSON:
                         )
                         yield StageChangeEvent(state=state)
 
-                        start_time = time.perf_counter()
-                        try:
-                            accession_summary = await asyncio.to_thread(
-                                self._present_accession_results, q, api_response
-                            )
-                        except Exception as e:
-                            logger.exception(
-                                "Presenting accession results failed: %s", e
-                            )
-                            accession_summary = f"(Could not summarise results; raw API response: {api_response})"
-                        end_time = time.perf_counter()
-                        logger.info(
-                            f"8. Summarise and present accession results: {end_time - start_time:0.1f} sec."
-                        )
+                        presentation_diagnostics: dict = {}
+                        with log_step("Summarise and present accession results", 8, token_tally) as step:
+                            step["model"] = GEMINI_MODEL
+                            try:
+                                accession_summary = await asyncio.to_thread(
+                                    self._present_accession_results, q, api_response,
+                                    presentation_diagnostics,
+                                )
+                                step["usage"] = presentation_diagnostics.get("usage_metadata")
+                            except Exception as e:
+                                logger.exception(
+                                    "Presenting accession results failed: %s", e
+                                )
+                                accession_summary = f"(Could not summarise results; raw API response: {api_response})"
                         appended_text = (
                             "\n\n---\n\n**Australian Grains Genebank (AGG) Accession Lookup:**\n"
                             + accession_summary
@@ -2589,10 +2714,13 @@ Input JSON:
                     usage_metadata,
                     q_emb,
                 )
-            yield ResultEvent(state=state)
+            yield ResultEvent(state=state.model_copy(update={"token_usage": summarise_token_tally(token_tally, time.perf_counter() - query_started)}))
         except Exception as e:
             logger.exception("query() failed: %s", e)
-            yield ErrorEvent(state=state.model_copy(update={"error": str(e)}))
+            yield ErrorEvent(state=state.model_copy(update={
+                "error": str(e),
+                "token_usage": summarise_token_tally(token_tally, time.perf_counter() - query_started),
+            }))
 
 
 def main():

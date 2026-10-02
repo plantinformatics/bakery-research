@@ -26,11 +26,24 @@ export type PlantBioRunState = {
   needs_clarification?: boolean;
   accessions?: string[];
   usage_metadata?: Record<string, unknown>;
+  /** Run-wide tally of every LLM call (question analysis, relevance judge,
+   * answer, accession steps). Sent with the final result/error snapshot. */
+  token_usage?: TokenUsageTally;
   /** Raw context retrieved from Neo4j and injected into the answer prompt. */
   literature_context?: string | null;
   metadata_context?: string | null;
   pretzel_context?: string | null;
   error?: string | null;
+};
+
+export type TokenUsageStep = Record<string, unknown> & {
+  step: string;
+  model?: string | null;
+};
+
+export type TokenUsageTally = {
+  total?: Record<string, unknown>;
+  by_step?: TokenUsageStep[];
 };
 
 export const STAGE_LABELS: Record<PipelineStage, string> = {
