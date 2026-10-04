@@ -28,7 +28,7 @@ from dotenv import load_dotenv
 
 from getPrompt import getPrompt
 from literature_graph_expansion import expand_literature_graph
-from literature_candidate_ranking import literature_candidate_sort_key, score_literature_candidate_texts, score_literature_candidate_vectors
+from literature_candidate_ranking import extract_literature_entity_terms, literature_candidate_sort_key, score_literature_candidate_texts, score_literature_candidate_vectors
 from taxon_filter import metadata_matches_taxon, resolve_taxon_filter, taxon_regex, text_is_clearly_other_taxon
 
 load_dotenv(Path(__file__).resolve().parents[1] / ".env")
@@ -269,6 +269,7 @@ def _resolve_max_context_chars(max_context_chars: Optional[int]) -> int:
 # CONTEXT OPTIMISATION
 # Metadata retrieval: filter taxon, then fetch vector/full-text candidates.
 SPECIES_FILTER_ENABLED = True
+# Literature retrieval intentionally does not apply the species/taxonomy filter.
 METADATA_FILTER_OVERFETCH_MULTIPLIER = 5  # Extra candidates before species filtering.
 METADATA_VECTOR_K = 40  # Matching vector candidates retained per expanded query.
 METADATA_FULLTEXT_K = 40  # Matching full-text candidates retained per expanded query.
@@ -299,15 +300,20 @@ MAX_TRIPLES = 50
 LITERATURE_TRIPLE_MAX_CHARACTERS = 5000  # Separate budget for literature relationships.
 RERANK_MAX_TEXT_CHARS = 1500  # Passage excerpt sent to the semantic evidence judge.
 LITERATURE_EXPANSION_SCORE_DISCOUNT = 0.5  # One-hop graph matches borrow only part of their originating chunk's RRF score.
+EXACT_ENTITY_MATCH_K = 200  # Full-text candidates for terms explicitly named in the original question.
+EXACT_ENTITY_RRF_WEIGHT = 1.0  # Additional RRF contribution from exact entity lookup.
 RERANK_CANDIDATES_PER_QUERY = 3  # Preserve candidates from each generated query.
+RERANK_EXACT_ENTITY_SLOTS = 8  # Source-diverse exact matches protected in the judge pool.
+RERANK_DIRECT_MATCH_SLOTS = 8  # Direct vector/full-text matches protected in the judge pool.
 RERANK_BATCH_SIZE = 16  # Batch size for the extra semantic-ranking calls.
 RERANK_MAX_CONCURRENT_BATCHES = 3  # Independent judge calls in flight; lower if API rate-limited.
+RERANK_MISSING_RETRY_LIMIT = 1  # Retry only passages omitted or malformed in judge responses.
 RERANK_MIN_SCORE = 2.0  # Exclude topic-only mentions; allow indirect and direct evidence.
 RERANK_MAX_METADATA_CHARS = 3000  # Metadata scope shown to the evidence judge.
 RERANK_MODEL = "gemini-2.5-flash"  # Lower-cost model used only for literature relevance scoring.
 
 # USER ADJUSTABLE VARIABLES 
-LITERATURE_CHUNKS_TO_RERANK = 100  # Maximum literature chunks sent to relevance ranking per request.
+LITERATURE_CHUNKS_TO_RERANK = 48  # Maximum literature chunks sent to relevance ranking per request.
 MAX_CHARACTERS = 50000  # The final size of the literature context sent to the LLM.
 
 # Accession API config
@@ -599,6 +605,36 @@ class PlantBioRAG:
             expanded_query, self._vector_chunks, self._fulltext_chunks, k,
             diagnostics=search_trace,
         )
+        exact_entity_ids = set()
+        search_trace["exact_entity_terms"] = []
+        search_trace.setdefault("ranking", {})["exact_entity"] = []
+        if expanded_query == original_question:
+            for term in extract_literature_entity_terms(original_question):
+                exact_scores = self._fulltext_chunks(term, EXACT_ENTITY_MATCH_K, exact_phrase=True)
+                search_trace["exact_entity_terms"].append(term)
+                for rank, (cid, score) in enumerate(
+                    sorted(exact_scores.items(), key=lambda item: item[1], reverse=True), start=1
+                ):
+                    contribution = EXACT_ENTITY_RRF_WEIGHT / (RRF_RANK_CONSTANT + rank)
+                    fused[cid] = fused.get(cid, 0.0) + contribution
+                    exact_entity_ids.add(cid)
+                    search_trace["ranking"]["exact_entity"].append({
+                        "term": term, "chunk_id": cid, "score": score,
+                        "rank": rank, "rrf_contribution": contribution,
+                    })
+            search_trace["ranking"]["rrf"] = [
+                {"chunk_id": cid, "score": fused[cid], "rank": rank}
+                for rank, cid in enumerate(
+                    sorted(fused, key=lambda cid: (-fused[cid], cid)), start=1
+                )
+            ]
+            groups = {}
+            for item in search_trace["ranking"]["rrf"]:
+                groups.setdefault(item["score"], []).append(item["chunk_id"])
+            search_trace.setdefault("ties", {})["rrf"] = [
+                {"score": score, "chunk_ids_in_rank_order": ids}
+                for score, ids in groups.items() if len(ids) > 1
+            ]
         ranked_cids = sorted(fused, key=lambda cid: (-fused[cid], cid))
         candidate_rows = self.graph.query(
             """
@@ -642,6 +678,7 @@ class PlantBioRAG:
             candidates.append({
                 "chunk_id": cid, "source_path": row.get("source_path", ""),
                 "text": row.get("text", ""), "rrf_score": fused[cid],
+                "exact_entity_match": cid in exact_entity_ids,
                 "included": False,
                 "rejection_reason": "Clearly identified as a different taxonomy",
             })
@@ -653,6 +690,7 @@ class PlantBioRAG:
                 candidates.append({
                     "chunk_id": cid, "source_path": row.get("source_path", ""),
                     "text": row["text"], "rrf_score": fused[cid],
+                    "exact_entity_match": cid in exact_entity_ids,
                     "included": False, "rejection_reason": "Outside RRF top-K",
                 })
         for chunk in all_chunks:
@@ -664,6 +702,7 @@ class PlantBioRAG:
                 "chunk_id": chunk_id, "source_path": chunk.get("source_path", ""),
                 "text": text,
                 "rrf_score": fused.get(chunk_id, expanded_chunk_scores.get(chunk_id)),
+                "exact_entity_match": chunk_id in exact_entity_ids,
                 "is_direct_search_match": chunk_id in fused,
                 "rejection_reason": (
                     "Clearly identified as a different taxonomy"
@@ -807,6 +846,79 @@ class PlantBioRAG:
         }
         query_hints = [query for query in expanded_queries if query != question][:12]
         metadata_scope = metadata_context[:RERANK_MAX_METADATA_CHARS]
+        def make_prompt(batch):
+            payload = [
+                {"id": index, "source": item.get("source_path", ""),
+                 "text": item.get("text", "")[:RERANK_MAX_TEXT_CHARS]}
+                for index, item in enumerate(batch)
+            ]
+            return getPrompt("literature_relevance_judge").rstrip() + "\n" + json.dumps(
+                {"question": question, "generated_queries": query_hints,
+                 "metadata_scope": metadata_scope, "passages": payload},
+                ensure_ascii=False,
+            )
+
+        def record_response(batch, batch_trace, response, started):
+            batch_trace.update({
+                "status": "response_received", "elapsed_seconds": time.perf_counter() - started,
+                "response_id": getattr(response, "id", None),
+                "response_metadata": getattr(response, "response_metadata", {}),
+            })
+            usage_totals = self._chunk_reranker_usage.value
+            usage_totals["calls"] += 1
+            usage = getattr(response, "usage_metadata", None)
+            if not isinstance(usage, dict):
+                usage = {}
+            batch_trace["usage_metadata"] = usage
+            for token_key in ("input_tokens", "output_tokens", "total_tokens"):
+                token_count = usage.get(token_key)
+                if isinstance(token_count, int) and not isinstance(token_count, bool):
+                    usage_totals[token_key] += token_count
+                else:
+                    usage_totals["available"] = False
+            raw = self._message_text(response).strip()
+            batch_trace["raw_response"] = raw
+            clean = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw, flags=re.I)
+            try:
+                parsed = json.loads(clean)
+                if not isinstance(parsed, dict) or not isinstance(parsed.get("items"), list):
+                    raise ValueError("Judge response must contain an items list")
+            except (ValueError, TypeError) as error:
+                batch_trace.update({"status": "parse_failed", "error": str(error)})
+                return
+            batch_trace["parsed_response"] = parsed
+            returned_ids = set()
+            for item in parsed["items"]:
+                if not isinstance(item, dict):
+                    continue
+                try:
+                    index = int(item["id"])
+                    if isinstance(item["id"], bool) or index < 0 or index >= len(batch):
+                        continue
+                    score = float(item["score"])
+                    if not np.isfinite(score):
+                        continue
+                    score = max(0.0, min(4.0, score))
+                except (KeyError, TypeError, ValueError):
+                    continue
+                candidate = batch[index]
+                entities = item.get("entities", [])
+                if not isinstance(entities, list):
+                    entities = []
+                reason = item.get("reason", "")
+                results[str(candidate.get("chunk_id") or id(candidate))] = {
+                    "semantic_score": score,
+                    "semantic_reason": reason.strip() if isinstance(reason, str) else "",
+                    "evidence_entities": sorted({
+                        " ".join(entity.split()) for entity in entities
+                        if isinstance(entity, str) and entity.strip()
+                    }),
+                }
+                returned_ids.add(index)
+            batch_trace["returned_passage_ids"] = sorted(returned_ids)
+            batch_trace["missing_passage_ids"] = sorted(set(range(len(batch))) - returned_ids)
+            batch_trace["status"] = "partial" if batch_trace["missing_passage_ids"] else "parsed"
+
         prepared_batches = []
         for start in range(0, len(candidates), RERANK_BATCH_SIZE):
             batch = candidates[start : start + RERANK_BATCH_SIZE]
@@ -817,23 +929,7 @@ class PlantBioRAG:
                 candidate["reranker_passage_id"] = index
                 candidate["reranker_text_chars"] = len(candidate.get("text", "")[:RERANK_MAX_TEXT_CHARS])
                 candidate["reranker_text_truncated"] = len(candidate.get("text", "")) > RERANK_MAX_TEXT_CHARS
-            payload = [
-                {
-                    "id": index,
-                    "source": item.get("source_path", ""),
-                    "text": item.get("text", "")[:RERANK_MAX_TEXT_CHARS],
-                }
-                for index, item in enumerate(batch)
-            ]
-            prompt = getPrompt("literature_relevance_judge").rstrip() + "\n" + json.dumps(
-                {
-                    "question": question,
-                    "generated_queries": query_hints,
-                    "metadata_scope": metadata_scope,
-                    "passages": payload,
-                },
-                ensure_ascii=False,
-            )
+            prompt = make_prompt(batch)
             batch_trace = {
                 "batch": batch_number, "model": RERANK_MODEL,
                 "candidate_ids_in_input_order": [item.get("diagnostic_id") or item.get("chunk_id") for item in batch],
@@ -852,53 +948,40 @@ class PlantBioRAG:
                 except Exception as error:
                     batch_trace.update({"status": "call_failed", "error": str(error),
                                         "elapsed_seconds": time.perf_counter() - started})
-                    raise
-                batch_trace.update({
-                    "status": "response_received", "elapsed_seconds": time.perf_counter() - started,
-                    "response_id": getattr(response, "id", None),
-                    "response_metadata": getattr(response, "response_metadata", {}),
-                })
-                usage_totals = self._chunk_reranker_usage.value
-                usage_totals["calls"] += 1
-                usage = getattr(response, "usage_metadata", None)
-                if not isinstance(usage, dict):
-                    usage = {}
-                batch_trace["usage_metadata"] = usage
-                for token_key in ("input_tokens", "output_tokens", "total_tokens"):
-                    token_count = usage.get(token_key)
-                    if isinstance(token_count, int) and not isinstance(token_count, bool):
-                        usage_totals[token_key] += token_count
-                    else:
-                        usage_totals["available"] = False
-                raw = self._message_text(response).strip()
-                batch_trace["raw_response"] = raw
-                clean = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw.strip(), flags=re.I)
+                    continue
                 try:
-                    parsed = json.loads(clean)
+                    record_response(batch, batch_trace, response, started)
                 except Exception as error:
                     batch_trace.update({"status": "parse_failed", "error": str(error)})
-                    raise
-                batch_trace["parsed_response"] = parsed
-                batch_trace["status"] = "parsed"
-                for item in parsed.get("items", []):
-                    try:
-                        candidate = batch[int(item["id"])]
-                        score = max(0.0, min(4.0, float(item["score"])))
-                    except (KeyError, TypeError, ValueError, IndexError):
-                        continue
-                    entities = item.get("entities", [])
-                    if not isinstance(entities, list):
-                        entities = []
-                    reason = item.get("reason", "")
-                    results[str(candidate.get("chunk_id") or id(candidate))] = {
-                        "semantic_score": score,
-                        "semantic_reason": reason.strip() if isinstance(reason, str) else "",
-                        "evidence_entities": sorted({
-                            " ".join(entity.split())
-                            for entity in entities
-                            if isinstance(entity, str) and entity.strip()
-                        }),
-                    }
+        for retry_number in range(1, RERANK_MISSING_RETRY_LIMIT + 1):
+            missing = [item for item in candidates if str(item.get("chunk_id") or id(item)) not in results]
+            if not missing:
+                break
+            for start in range(0, len(missing), RERANK_BATCH_SIZE):
+                batch = missing[start : start + RERANK_BATCH_SIZE]
+                prompt = make_prompt(batch)
+                batch_trace = {
+                    "batch": len(self._chunk_reranker_usage.batches) + 1,
+                    "retry": retry_number,
+                    "model": RERANK_MODEL,
+                    "candidate_ids_in_input_order": [item.get("diagnostic_id") or item.get("chunk_id") for item in batch],
+                    "prompt": prompt,
+                    "prompt_chars": len(prompt),
+                    "prompt_sha256": hashlib.sha256(prompt.encode("utf-8")).hexdigest(),
+                    "status": "started",
+                }
+                self._chunk_reranker_usage.batches.append(batch_trace)
+                started = time.perf_counter()
+                try:
+                    response = self._reranker_llm.invoke(prompt)
+                except Exception as error:
+                    batch_trace.update({"status": "call_failed", "error": str(error),
+                                        "elapsed_seconds": time.perf_counter() - started})
+                    continue
+                try:
+                    record_response(batch, batch_trace, response, started)
+                except Exception as error:
+                    batch_trace.update({"status": "parse_failed", "error": str(error)})
         return results
 
     @staticmethod
@@ -1002,6 +1085,7 @@ class PlantBioRAG:
                     else:
                         current["retrieval_queries"].extend(item.get("retrieval_queries", []))
                         current["is_direct_search_match"] = bool(current.get("is_direct_search_match") or item.get("is_direct_search_match"))
+                        current["exact_entity_match"] = bool(current.get("exact_entity_match") or item.get("exact_entity_match"))
                         if item.get("rejection_reason") is None:
                             current["_eligible"] = True
                             current["rejection_reason"] = None
@@ -1105,11 +1189,13 @@ class PlantBioRAG:
             item["text_sha256"] = hashlib.sha256(item.get("text", "").encode("utf-8")).hexdigest()
             item["diagnostic_id"] = item.get("chunk_id") or item["text_sha256"]
             item["sent_to_relevance_ranker"] = False
+            item["pool_selection_reason"] = None
         combined_rrf_groups = {}
         for item in rrf_ranked:
             combined_rrf_groups.setdefault(item.get("rrf_score") or 0.0, []).append(item.get("chunk_id"))
 
         eligible_chunks = [item for item in all_chunks if item.get("rejection_reason") is None]
+        eligible_object_ids = {id(item) for item in eligible_chunks}
         rerank_pool: list[dict[str, Any]] = []
         pool_ids = set()
         for query in expanded_queries:
@@ -1130,13 +1216,41 @@ class PlantBioRAG:
                 if identity not in pool_ids and len(rerank_pool) < LITERATURE_CHUNKS_TO_RERANK:
                     pool_ids.add(identity)
                     rerank_pool.append(item)
+                    item["pool_selection_reason"] = "Expanded query coverage"
+        exact_candidates = [item for item in candidate_ranked if item.get("exact_entity_match") and id(item) in eligible_object_ids]
+        exact_added = 0
+        seen_sources = {item.get("source_path") for item in rerank_pool}
+        for source_diversity in (True, False):
+            for item in exact_candidates:
+                if exact_added >= RERANK_EXACT_ENTITY_SLOTS or len(rerank_pool) >= LITERATURE_CHUNKS_TO_RERANK:
+                    break
+                identity = item.get("chunk_id") or id(item)
+                source = item.get("source_path")
+                if identity in pool_ids or (source_diversity and source in seen_sources):
+                    continue
+                pool_ids.add(identity)
+                seen_sources.add(source)
+                rerank_pool.append(item)
+                item["pool_selection_reason"] = "Exact entity match"
+                exact_added += 1
+        direct_added = 0
+        for item in candidate_ranked:
+            if direct_added >= RERANK_DIRECT_MATCH_SLOTS or len(rerank_pool) >= LITERATURE_CHUNKS_TO_RERANK:
+                break
+            identity = item.get("chunk_id") or id(item)
+            if id(item) in eligible_object_ids and item.get("retrieval_origin") in ("direct", "direct_and_expanded") and identity not in pool_ids:
+                pool_ids.add(identity)
+                rerank_pool.append(item)
+                item["pool_selection_reason"] = "Direct search match"
+                direct_added += 1
         for item in candidate_ranked:
             if len(rerank_pool) >= LITERATURE_CHUNKS_TO_RERANK:
                 break
             identity = item.get("chunk_id") or id(item)
-            if item in eligible_chunks and identity not in pool_ids:
+            if id(item) in eligible_object_ids and identity not in pool_ids:
                 pool_ids.add(identity)
                 rerank_pool.append(item)
+                item["pool_selection_reason"] = "Candidate score"
         reranker_error = None
         pool_ids_in_order = [item["diagnostic_id"] for item in rerank_pool]
         pool_seconds = time.perf_counter() - pool_started
@@ -1146,29 +1260,36 @@ class PlantBioRAG:
             rerank_results = self._semantic_rerank_chunks(
                 relevance_question, expanded_queries, metadata_context, rerank_pool
             )
-            if len(rerank_results) != len(rerank_pool):
-                raise ValueError("Semantic reranker returned an incomplete result set")
             for item in rerank_pool:
-                result = rerank_results[str(item.get("chunk_id") or id(item))]
-                item.update(result)
+                result = rerank_results.get(str(item.get("chunk_id") or id(item)))
+                if result is not None:
+                    item.update(result)
+                else:
+                    item.update({"semantic_score": None, "semantic_reason": "Judge score unavailable after retry",
+                                 "evidence_entities": []})
+            missing_count = sum(item.get("semantic_score") is None for item in rerank_pool)
+            if missing_count:
+                reranker_error = f"{missing_count} of {len(rerank_pool)} passages have no judge score after retry"
+                logger.warning("Literature semantic reranker: %s", reranker_error)
         except Exception as error:
             logger.warning("Literature semantic reranking failed; using candidate order: %s", error)
             reranker_error = str(error)
-            rerank_pool = eligible_chunks
-            for item in eligible_chunks:
-                item["semantic_score"] = None
-                item["evidence_entities"] = []
+            for item in rerank_pool:
+                if item.get("semantic_score") is None:
+                    item.update({"semantic_score": None, "semantic_reason": "Judge unavailable",
+                                 "evidence_entities": []})
         reranker_seconds = time.perf_counter() - reranker_started
         logger.info("Literature relevance judge: %.2fs", reranker_seconds)
 
         for item in eligible_chunks:
-            if item.get("semantic_score") is None and rerank_pool is not eligible_chunks:
+            if not item.get("sent_to_relevance_ranker"):
                 item["rejection_reason"] = "Outside semantic reranker candidate pool"
-        semantic_available = bool(rerank_pool) and rerank_pool[0].get("semantic_score") is not None
+        semantic_available = any(item.get("semantic_score") is not None for item in rerank_pool)
         ranked_pool = sorted(
             rerank_pool,
             key=lambda item: (
-                item.get("semantic_score") if semantic_available else 0.0,
+                (item.get("semantic_score") if item.get("semantic_score") is not None else -1.0)
+                if semantic_available else 0.0,
                 item.get("candidate_score") or 0.0,
                 -len(item.get("text", "")),
             ),
@@ -1176,7 +1297,7 @@ class PlantBioRAG:
         )
         for rank, item in enumerate(ranked_pool, start=1):
             item["rank"] = rank
-            if semantic_available and item["semantic_score"] < RERANK_MIN_SCORE:
+            if semantic_available and item.get("semantic_score") is not None and item["semantic_score"] < RERANK_MIN_SCORE:
                 item["rejection_reason"] = "Below semantic relevance threshold"
 
         ranked_chunks = sorted(
@@ -1270,7 +1391,7 @@ class PlantBioRAG:
                 "reranker_batches": getattr(self._chunk_reranker_usage, "batches", []),
                 "metadata_scope_used_by_judge": metadata_context[:RERANK_MAX_METADATA_CHARS],
                 "metadata_scope_truncated": len(metadata_context) > RERANK_MAX_METADATA_CHARS,
-                "rrf_aggregation_rule": "Sum per-query RRF only for eligible branches; otherwise retain maximum rejected-branch score. Expanded chunks inherit the maximum originating seed score per query.",
+                "rrf_aggregation_rule": "Sum per-query RRF only for eligible branches; otherwise retain maximum rejected-branch score. The original query also adds exact entity full-text RRF contributions. Expanded chunks inherit the maximum originating seed score per query.",
                 "rrf_tie_rule": "Equal RRF scores use each chunk's vector similarity to the question, then question-term overlap, direct-search status, and chunk ID.",
                 "candidate_ranking_rule": "Direct matches keep their own per-query RRF. Expansion-only matches use the originating RRF times the expansion discount and their own vector/lexical match. Eligible per-query candidate scores are summed before the judge pool is selected.",
                 "vector_tie_break_scored_count": vector_scored_count,
@@ -1288,7 +1409,11 @@ class PlantBioRAG:
                 "candidate_count": len(eligible_chunks),
                 "scored_count": sum(item.get("semantic_score") is not None for item in ranked_pool),
                 "candidate_limit": LITERATURE_CHUNKS_TO_RERANK,
+                "exact_entity_slots": RERANK_EXACT_ENTITY_SLOTS,
+                "direct_match_slots": RERANK_DIRECT_MATCH_SLOTS,
                 "minimum_score": RERANK_MIN_SCORE,
+                "missing_score_count": sum(item.get("semantic_score") is None for item in rerank_pool),
+                "retry_calls": sum(bool(batch.get("retry")) for batch in getattr(self._chunk_reranker_usage, "batches", [])),
                 "token_usage": dict(self._chunk_reranker_usage.value),
                 "fallback_error": reranker_error,
             },
@@ -1369,11 +1494,13 @@ class PlantBioRAG:
 
     # 2. Full-text indexing
     def _fulltext_chunks(
-        self, q: str, k: int = QUERY_FULL_TEXT_MAX_CHUNKS
+        self, q: str, k: int = QUERY_FULL_TEXT_MAX_CHUNKS, exact_phrase: bool = False
     ) -> Dict[str, float]:
         cleaned_q = self.escape_lucene_plain_text(q)
         if not cleaned_q:
             return {}
+        if exact_phrase:
+            cleaned_q = f'"{cleaned_q}"'
         res = self.graph.query(
             """
             CALL db.index.fulltext.queryNodes('idx_chunk_text', $q) YIELD node, score
@@ -1529,8 +1656,14 @@ class PlantBioRAG:
         ]
         # Always include original user question first for exact-match retrieval
         expanded_queries.insert(0, q)
-        # De-duplicate while preserving order
-        expanded_queries = list(dict.fromkeys(expanded_queries))
+        # Avoid repeating retrieval for case/spacing/punctuation variants.
+        unique_queries, seen_queries = [], set()
+        for candidate in expanded_queries:
+            key = " ".join(candidate.split()).casefold().rstrip(" ?.!")
+            if key and key not in seen_queries:
+                seen_queries.add(key)
+                unique_queries.append(candidate)
+        expanded_queries = unique_queries
         is_agg_accession_query = bool(data.get("is_agg_accession_query", False))
         is_direct_agg_lookup = bool(data.get("is_direct_agg_lookup", False))
         raw_direct_accessions = data.get("direct_agg_accessions", [])
@@ -2059,6 +2192,9 @@ Input JSON:
                 logger.warning("%s context retrieval failed: %s", label, e)
                 return ""
 
+        # Keep the taxon filter on metadata only. Mixed-species literature tables
+        # must remain eligible for ranking and context selection.
+        literature_taxon_filter = None
         with ThreadPoolExecutor(max_workers=3) as executor:
             metadata_future = executor.submit(
                 safe_call,
@@ -2075,7 +2211,7 @@ Input JSON:
                 expanded_queries,
                 k,
                 max_context_chars,
-                taxon_filter,
+                literature_taxon_filter,
                 True,
                 q,
                 metadata_future,
