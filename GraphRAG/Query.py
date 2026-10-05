@@ -1351,6 +1351,7 @@ class PlantBioRAG:
             "expanded_queries": expanded_queries,
             "chunks": all_chunks,
             "rrf_ranked": rrf_ranked,
+            "candidate_ranked": candidate_ranked,
             "triples": list(deduplicated.values()),
             "run_trace": {
                 "question_used_for_relevance": relevance_question,
@@ -1389,6 +1390,7 @@ class PlantBioRAG:
         expanded_queries = candidates["expanded_queries"]
         all_chunks = candidates["chunks"]
         rrf_ranked = candidates["rrf_ranked"]
+        candidate_ranked = candidates["candidate_ranked"]
         pool_started = time.perf_counter()
         eligible_chunks = [item for item in all_chunks if item.get("rejection_reason") is None]
         eligible_object_ids = {id(item) for item in eligible_chunks}
@@ -2439,7 +2441,7 @@ Input JSON:
                 "Literature",
                 expanded_queries,
                 k,
-                taxon_filter,
+                literature_taxon_filter,
                 q,
             )
             pretzel_future = None
