@@ -14,8 +14,40 @@ _STOPWORDS = {
     "a", "an", "and", "any", "are", "as", "at", "be", "between", "by",
     "do", "does", "for", "from", "have", "how", "in", "is", "it", "of",
     "on", "or", "that", "the", "their", "these", "this", "to", "what",
-    "which", "with",
+    "when", "where", "which", "who", "why", "with",
 }
+
+
+def extract_literature_entity_terms(question, max_terms=3):
+    """Find explicit identifiers and names in the user's wording for exact lookup."""
+    matches = []
+    patterns = (
+        r"[\"“”‘’']([^\"“”‘’']{3,60})[\"“”‘’']",
+        r"\b(?=[A-Za-z0-9._-]*\d)[A-Za-z][A-Za-z0-9._-]{2,}\b",
+        r"\b(?:[A-Z]{2,}|[A-Z][a-z]+)(?:\s+(?:[A-Z]{2,}|[A-Z][a-z]+)){1,3}\b",
+        r"\b[A-Z]{3,}\b",
+    )
+    for pattern in patterns:
+        for match in re.finditer(pattern, question):
+            term = (match.group(1) if match.lastindex else match.group()).strip()
+            words = term.split()
+            while len(words) > 1 and words[0].casefold() in _STOPWORDS:
+                words.pop(0)
+            term = " ".join(words)
+            if term.casefold() not in _STOPWORDS and not term.isdigit():
+                matches.append((match.end() - len(term), match.end(), term))
+    terms, seen, selected_spans = [], set(), []
+    for start, end, term in sorted(matches, key=lambda match: (match[0], -(match[1] - match[0]))):
+        if any(start < selected_end and end > selected_start for selected_start, selected_end in selected_spans):
+            continue
+        key = term.casefold()
+        if key not in seen:
+            seen.add(key)
+            terms.append(term)
+            selected_spans.append((start, end))
+        if len(terms) >= max_terms:
+            break
+    return terms
 
 
 def score_literature_candidate_texts(candidates, question, expanded_queries):
