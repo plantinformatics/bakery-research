@@ -9,6 +9,8 @@ import math
 import re
 import time
 
+from taxon_filter import TAXON_ALIASES
+
 
 _STOPWORDS = {
     "a", "an", "and", "any", "are", "as", "at", "be", "between", "by",
@@ -18,26 +20,57 @@ _STOPWORDS = {
 }
 
 
+# Request words that start questions but are never part of a name.
+_LEADING_FILLER = {
+    "about", "can", "compare", "could", "describe", "explain", "find", "give",
+    "i", "list", "me", "my", "please", "show", "summarise", "summarize", "tell",
+    "we", "you",
+}
+# Acronyms common enough in this corpus that an exact match says nothing.
+_GENERIC_ACRONYMS = {
+    "AGG", "DNA", "GWAS", "PCR", "QTL", "QTLS", "RNA", "SNP", "SNPS",
+}
+# Multi-word crop/species names, e.g. "triticum aestivum", "durum wheat".
+_SPECIES_PHRASES = sorted(
+    {alias for aliases in TAXON_ALIASES.values() for alias in aliases if " " in alias},
+    key=len, reverse=True,
+)
+
+
 def extract_literature_entity_terms(question, max_terms=3):
-    """Find explicit identifiers and names in the user's wording for exact lookup."""
-    matches = []
+    """Find explicit identifiers and names in the user's wording for exact lookup.
+
+    Terms are kept in priority order (quoted, identifier, species, proper-noun
+    phrase, acronym) so a weak match cannot crowd out a strong one.
+    """
     patterns = (
         r"[\"“”‘’']([^\"“”‘’']{3,60})[\"“”‘’']",
         r"\b(?=[A-Za-z0-9._-]*\d)[A-Za-z][A-Za-z0-9._-]{2,}\b",
+        r"(?i)\b(" + "|".join(r"\s+".join(map(re.escape, p.split())) for p in _SPECIES_PHRASES) + r")\b",
         r"\b(?:[A-Z]{2,}|[A-Z][a-z]+)(?:\s+(?:[A-Z]{2,}|[A-Z][a-z]+)){1,3}\b",
         r"\b[A-Z]{3,}\b",
     )
-    for pattern in patterns:
+    matches = []
+    for priority, pattern in enumerate(patterns):
         for match in re.finditer(pattern, question):
-            term = (match.group(1) if match.lastindex else match.group()).strip()
-            words = term.split()
-            while len(words) > 1 and words[0].casefold() in _STOPWORDS:
+            group = 1 if match.lastindex else 0
+            words = match.group(group).split()
+            start = match.start(group)
+            while len(words) > 1 and words[0].casefold() in _STOPWORDS | _LEADING_FILLER:
+                start = question.index(words[1], start + len(words[0]))
                 words.pop(0)
             term = " ".join(words)
-            if term.casefold() not in _STOPWORDS and not term.isdigit():
-                matches.append((match.end() - len(term), match.end(), term))
+            if (
+                term.casefold() in _STOPWORDS | _LEADING_FILLER
+                or all(word.upper() in _GENERIC_ACRONYMS for word in words)
+                or term.isdigit()
+                # A proper-noun phrase stripped to one word is just a capitalised word.
+                or (priority == 3 and len(words) < 2)
+            ):
+                continue
+            matches.append((priority, start, start + len(term), term))
     terms, seen, selected_spans = [], set(), []
-    for start, end, term in sorted(matches, key=lambda match: (match[0], -(match[1] - match[0]))):
+    for priority, start, end, term in sorted(matches, key=lambda match: (match[0], -(match[2] - match[1]), match[1])):
         if any(start < selected_end and end > selected_start for selected_start, selected_end in selected_spans):
             continue
         key = term.casefold()
