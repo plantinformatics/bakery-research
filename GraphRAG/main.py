@@ -3,6 +3,7 @@ import uuid
 from typing import Any, AsyncGenerator, Optional, Tuple
 
 from ag_ui.core import (
+    CustomEvent,
     ReasoningEndEvent,
     ReasoningMessageContentEvent,
     ReasoningMessageEndEvent,
@@ -31,12 +32,14 @@ from Query import (
     MAX_CHARACTERS,
     MAX_LITERATURE_CONTEXT_CHARS,
     MIN_LITERATURE_CONTEXT_CHARS,
+    PRETZEL_DOCS_URL,
     ErrorEvent,
     PlantBioRAG,
     ReasoningEvent,
     ResultEvent,
     StageChangeEvent,
     TextEvent,
+    UiDataEvent,
 )
 
 logger = logging.getLogger(__name__)
@@ -172,6 +175,10 @@ async def _run_agui_events(input: RunAgentInput) -> AsyncGenerator[str, None]:
                 yield encoder.encode(
                     TextMessageContentEvent(message_id=message_id, delta=event.text)
                 )
+            elif isinstance(event, UiDataEvent):
+                # Becomes a named `data` part of the current assistant message
+                # in assistant-ui (see `frontend/components/message-data-boxes.tsx`).
+                yield encoder.encode(CustomEvent(name=event.name, value=event.value))
             elif isinstance(event, ResultEvent):
                 for e in _close_reasoning():
                     yield e
@@ -225,4 +232,7 @@ async def get_options() -> dict:
         "maxLiteratureContextChars": MAX_LITERATURE_CONTEXT_CHARS,
         "literatureContextCharsStep": LITERATURE_CONTEXT_CHARS_STEP,
         "defaultLiteratureContextChars": MAX_CHARACTERS,
+        # Link for the composer's Pretzel indicator
+        # (`frontend/components/pretzel-pathway-indicator.tsx`).
+        "pretzelDocsUrl": PRETZEL_DOCS_URL,
     }

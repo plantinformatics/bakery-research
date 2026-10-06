@@ -8,6 +8,7 @@ import {
 } from "@assistant-ui/react";
 import { Thread } from "@/components/assistant-ui/elements/thread.aui";
 import { PipelineStatus } from "@/components/pipeline-status";
+import { MessageDataBoxes } from "@/components/message-data-boxes";
 import type { FC } from "react";
 
 const ThreadWelcome: FC = () => {
@@ -54,6 +55,7 @@ function ThreadWithSuggestions() {
 export default function Home() {
   return (
     <main className="relative flex h-dvh flex-col">
+      <MessageDataBoxes />
       <PipelineStatus />
       <div className="relative min-h-0 flex-1">
         <ThreadWithSuggestions />

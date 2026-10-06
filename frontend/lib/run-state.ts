@@ -26,6 +26,13 @@ export type PlantBioRunState = {
    * echoed back so the frontend can confirm the slider choice took effect. */
   max_context_chars?: number;
   species?: string;
+  /** Jev question checks (`Query.py`). Probabilities are null when the
+   * check was skipped or failed. `out_of_scope` runs were declined before
+   * the pipeline started, so the status panel shows no stage as reached. */
+  in_scope_probability?: number | null;
+  out_of_scope?: boolean;
+  pretzel_probability?: number | null;
+  is_pretzel_question?: boolean;
   is_agg_accession_query?: boolean;
   needs_clarification?: boolean;
   accessions?: string[];

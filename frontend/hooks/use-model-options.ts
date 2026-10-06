@@ -16,6 +16,8 @@ export type ModelOptions = {
   maxLiteratureContextChars: number;
   literatureContextCharsStep: number;
   defaultLiteratureContextChars: number;
+  /** Pretzel documentation link (`Query.py`'s `PRETZEL_DOCS_URL`). */
+  pretzelDocsUrl: string;
 };
 
 /**
@@ -33,6 +35,7 @@ const FALLBACK_OPTIONS: ModelOptions = {
   maxLiteratureContextChars: 100000,
   literatureContextCharsStep: 10000,
   defaultLiteratureContextChars: 50000,
+  pretzelDocsUrl: "https://docs.plantinformatics.io/",
 };
 
 /** Fetches the selectable models/reasoning levels for `ModelSelector` from
@@ -66,6 +69,7 @@ export function useModelOptions(): ModelOptions {
           defaultLiteratureContextChars:
             data.defaultLiteratureContextChars ??
             prev.defaultLiteratureContextChars,
+          pretzelDocsUrl: data.pretzelDocsUrl ?? prev.pretzelDocsUrl,
         }));
       })
       .catch((err: unknown) => {

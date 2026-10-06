@@ -1,0 +1,39 @@
+{
+  "description": "Test questions for the two Jev gates in Query.py: the scope check (`in_scope`) and the Pretzel how-to check (`pretzel_how_to`). `null` marks a borderline case with no fixed expectation; record what Jev returned when reviewing. Run with `GraphRAG/evals/run_jev_gates.py`.",
+  "questions": [
+    {"question": "do any of the 10 wheat genomes carry Lr46?", "in_scope": true, "pretzel_how_to": false},
+    {"question": "do any of the 10 wheat genomes carry Yr29?", "in_scope": true, "pretzel_how_to": false},
+    {"question": "is there a relationship between Lr46 and Yr29?", "in_scope": true, "pretzel_how_to": false},
+    {"question": "Which wheat accessions carry Lr46 and are available in AGG?", "in_scope": true, "pretzel_how_to": false},
+    {"question": "Is the wheat variety Wyalkatchem available in the Australian Grains Genebank?", "in_scope": true, "pretzel_how_to": false},
+    {"question": "Which markers are linked to the stem rust resistance gene Sr2?", "in_scope": true, "pretzel_how_to": false},
+    {"question": "What QTL are associated with grain yield in barley under drought?", "in_scope": true, "pretzel_how_to": false},
+    {"question": "What genome assemblies are available for lentil?", "in_scope": true, "pretzel_how_to": false},
+    {"question": "Which datasets have BLAST databases available?", "in_scope": true, "pretzel_how_to": false},
+    {"question": "What is a QTL?", "in_scope": true, "pretzel_how_to": false},
+    {"question": "Does any dataset in Pretzel include markers for Lr34?", "in_scope": true, "pretzel_how_to": false},
+
+    {"question": "How do I align two genome assemblies in Pretzel?", "in_scope": true, "pretzel_how_to": true},
+    {"question": "How can I flip the orientation of a genetic map so it matches the genome?", "in_scope": true, "pretzel_how_to": true},
+    {"question": "How do I order samples by haplotype after loading VCF genotype data?", "in_scope": true, "pretzel_how_to": true},
+    {"question": "How do I search for where a nucleotide sequence is located using BLAST?", "in_scope": true, "pretzel_how_to": true},
+    {"question": "What do I need to load so that the markers in a VCF dataset are searchable?", "in_scope": true, "pretzel_how_to": true},
+    {"question": "How do I find the genotype ID for an AGG accession so I can select it in Pretzel?", "in_scope": true, "pretzel_how_to": true},
+    {"question": "Can you walk me through viewing a genetic map in pretzel", "in_scope": true, "pretzel_how_to": true},
+    {"question": "What is Pretzel built on?", "in_scope": true, "pretzel_how_to": null},
+
+    {"question": "What's the weather in Melbourne tomorrow?", "in_scope": false, "pretzel_how_to": false},
+    {"question": "Write me a Python function that reverses a linked list.", "in_scope": false, "pretzel_how_to": false},
+    {"question": "Who won the 2024 AFL grand final?", "in_scope": false, "pretzel_how_to": false},
+    {"question": "Give me a sourdough bread recipe.", "in_scope": false, "pretzel_how_to": false},
+    {"question": "How do I reset my Outlook password?", "in_scope": false, "pretzel_how_to": false},
+    {"question": "Tell me a joke.", "in_scope": false, "pretzel_how_to": false},
+    {"question": "What is the capital of France?", "in_scope": false, "pretzel_how_to": false},
+    {"question": "How should I treat a sore throat?", "in_scope": false, "pretzel_how_to": false},
+    {"question": "How do I bake soft pretzels at home?", "in_scope": false, "pretzel_how_to": false},
+
+    {"question": "hi", "in_scope": null, "pretzel_how_to": false},
+    {"question": "How do I grow tomatoes in my backyard?", "in_scope": null, "pretzel_how_to": false},
+    {"question": "What is the current price of wheat futures?", "in_scope": null, "pretzel_how_to": false}
+  ]
+}

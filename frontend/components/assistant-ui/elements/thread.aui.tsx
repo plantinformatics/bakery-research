@@ -25,6 +25,7 @@ import {
 } from "@/components/assistant-ui/elements/tool-group.aui";
 import { TooltipIconButton } from "@/components/assistant-ui/elements/tooltip-icon-button";
 import { LiteratureContextSelector } from "@/components/literature-context-selector";
+import { PretzelPathwayIndicator } from "@/components/pretzel-pathway-indicator";
 import { ModelSelector } from "@/components/model-selector";
 import { Button } from "@/components/ui/button";
 import { Skeleton } from "@/components/ui/skeleton";
@@ -303,6 +304,7 @@ const ComposerAction: FC = () => {
         </AuiIf>
         <ModelSelector />
         <LiteratureContextSelector />
+        <PretzelPathwayIndicator />
       </div>
       <div className="flex shrink-0 items-center gap-1.5">
         <AuiIf condition={(s) => s.thread.capabilities.dictation}>
