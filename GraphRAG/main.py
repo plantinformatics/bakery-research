@@ -1,8 +1,12 @@
 import logging
+import os
+import subprocess
 import uuid
+from pathlib import Path
 from typing import Any, AsyncGenerator, Optional, Tuple
 
 from ag_ui.core import (
+    CustomEvent,
     ReasoningEndEvent,
     ReasoningMessageContentEvent,
     ReasoningMessageEndEvent,
@@ -31,12 +35,14 @@ from Query import (
     MAX_CHARACTERS,
     MAX_LITERATURE_CONTEXT_CHARS,
     MIN_LITERATURE_CONTEXT_CHARS,
+    PRETZEL_DOCS_URL,
     ErrorEvent,
     PlantBioRAG,
     ReasoningEvent,
     ResultEvent,
     StageChangeEvent,
     TextEvent,
+    UiDataEvent,
 )
 
 logger = logging.getLogger(__name__)
@@ -53,6 +59,34 @@ app.add_middleware(
 
 # Shared across requests: holds the Neo4j/Gemini clients only, no per-run state.
 rag = PlantBioRAG()
+
+
+def _git_version() -> dict:
+    """Commit/branch of the repo (frontend and backend share it) when this
+    process started; uvicorn --reload restarts it, so it stays current in dev.
+    Read-only git calls: if git is missing, there is no `.git`, or git refuses
+    the repo (e.g. "dubious ownership" when it is owned by another user), the
+    fields are None rather than an error. Set `APP_COMMIT` / `APP_BRANCH` to
+    override, e.g. in a deployed image without `.git`."""
+    repo_dir = Path(__file__).resolve().parent
+
+    def git(*args: str) -> Optional[str]:
+        try:
+            result = subprocess.run(
+                ["git", *args], cwd=repo_dir, capture_output=True, text=True,
+                timeout=5, check=True,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return None
+        return result.stdout.strip()
+
+    commit = os.getenv("APP_COMMIT") or git("rev-parse", "--short", "HEAD")
+    branch = os.getenv("APP_BRANCH") or git("rev-parse", "--abbrev-ref", "HEAD")
+    return {"commit": commit or None, "branch": branch or None}
+
+
+BACKEND_VERSION = _git_version()
+logger.info("Backend version: %s", BACKEND_VERSION)
 
 
 def _forwarded_model_selection(
@@ -172,6 +206,10 @@ async def _run_agui_events(input: RunAgentInput) -> AsyncGenerator[str, None]:
                 yield encoder.encode(
                     TextMessageContentEvent(message_id=message_id, delta=event.text)
                 )
+            elif isinstance(event, UiDataEvent):
+                # Becomes a named `data` part of the current assistant message
+                # in assistant-ui (see `frontend/components/message-data-boxes.tsx`).
+                yield encoder.encode(CustomEvent(name=event.name, value=event.value))
             elif isinstance(event, ResultEvent):
                 for e in _close_reasoning():
                     yield e
@@ -225,4 +263,10 @@ async def get_options() -> dict:
         "maxLiteratureContextChars": MAX_LITERATURE_CONTEXT_CHARS,
         "literatureContextCharsStep": LITERATURE_CONTEXT_CHARS_STEP,
         "defaultLiteratureContextChars": MAX_CHARACTERS,
+        # Link for the composer's Pretzel indicator
+        # (`frontend/components/pretzel-pathway-indicator.tsx`).
+        "pretzelDocsUrl": PRETZEL_DOCS_URL,
+        # Shown under the composer (`frontend/components/app-version.tsx`)
+        # and in chat exports.
+        "backendVersion": BACKEND_VERSION,
     }

@@ -28,6 +28,7 @@ from contextlib import contextmanager
 from threading import local
 from dotenv import load_dotenv
 from rich.logging import RichHandler
+from typesafe_sdk import Noul, TypeSafeClient
 
 from getPrompt import getPrompt
 from literature_graph_expansion import expand_literature_graph
@@ -435,6 +436,58 @@ RERANK_MIN_SCORE = 2.0  # Exclude topic-only mentions; allow indirect and direct
 RERANK_MAX_METADATA_CHARS = 3000  # Metadata scope shown to the evidence judge.
 RERANK_MODEL = "gemini-2.5-flash"  # Lower-cost model used only for literature relevance scoring.
 
+# Jev (TypeSafe System One) question checks. Each asks one yes/no question
+# about the user's question and returns a probability; see
+# `GraphRAG/evals/jev_gate_questions.json` for the questions they were tuned on.
+# Needs JEV_API_KEY; without it both checks are skipped (question treated as
+# in scope, Pretzel docs searched only when the question names Pretzel).
+JEV_MODEL = "jev-latest"
+JEV_TIMEOUT_SECONDS = 15
+# Decline only when Jev is confident the question is out of scope, so
+# borderline questions still get a full answer.
+JEV_IN_SCOPE_MIN_PROBABILITY = 0.2
+JEV_PRETZEL_MIN_PROBABILITY = 0.5
+JEV_ASSISTANT_SCOPE = [
+    "Plant biology, genetics, genomics and crop breeding research, e.g. genes, alleles, QTL, markers, traits, disease resistance, cultivars, lines and pedigrees of crops such as wheat, barley, pulses and oilseeds",
+    "Genomic and genetic datasets: genome assemblies, genetic maps, marker and annotation datasets, VCF genotype data, BLAST databases, and their metadata",
+    "Australian Grains Genebank (AGG) accessions: whether accessions are held and their details",
+    "Using Pretzel, a web application for viewing and aligning genomes, genetic maps, markers and genotype data",
+]
+JEV_PRETZEL_DESCRIPTION = (
+    "Pretzel is a web application for interactively displaying, aligning and "
+    "comparing genetic and genomic datasets: genome assemblies and chromosomes, "
+    "genetic maps, marker and annotation datasets, BLAST sequence search, and VCF "
+    "genotype data for accessions/samples (e.g. ordering samples by haplotype)."
+)
+JEV_SCOPE_QUESTIONS = {
+    "in_scope": Noul(
+        instructions="Is `question` something this plant research assistant can help with, given the topics it covers in `assistant_scope`?",
+        criteria={
+            "true": "The question asks about one of the topics in `assistant_scope`, even partly, broadly or vaguely.",
+            "false": "The question is about something else, such as general knowledge, news, sport, weather, cooking, health, programming, IT support, or casual conversation.",
+        },
+    ),
+}
+JEV_PRETZEL_QUESTIONS = {
+    "pretzel_how_to": Noul(
+        instructions="Is `question` asking how to use the Pretzel application described in `pretzel`: how to do a task in it, load or view data in it, or use one of its features? The question may not name Pretzel.",
+        criteria={
+            "true": "The question asks how to carry out a task or use a feature of the application, such as aligning, viewing, loading, searching or ordering datasets in it.",
+            "false": "The question asks for biological or genetic facts, which datasets or accessions exist, or about something other than using the application.",
+        },
+    ),
+}
+OUT_OF_SCOPE_MESSAGE = (
+    "Sorry, that question is outside the scope of this assistant. I can help "
+    "with plant biology and genetics research literature, genomic dataset "
+    "metadata, Australian Grains Genebank (AGG) accessions, and using Pretzel.\n\n"
+    "If you think this question should be covered, please get in touch and "
+    "include a copy of this chat."
+)
+# Shown by the frontend's out-of-scope contact box and Pretzel question box.
+CONTACT_EMAIL = os.getenv("CONTACT_EMAIL") or ""
+PRETZEL_DOCS_URL = os.getenv("PRETZEL_DOCS_URL") or "https://docs.plantinformatics.io/"
+
 # USER ADJUSTABLE VARIABLES 
 LITERATURE_CHUNKS_TO_RERANK = 48  # Maximum literature chunks sent to relevance ranking per request.
 MAX_CHARACTERS = 50000  # The final size of the literature context sent to the LLM.
@@ -486,6 +539,12 @@ class RunState(BaseModel):
     # `_resolve_max_context_chars` has applied its fallback.
     max_context_chars: int = MAX_CHARACTERS
     species: str = ""
+    # Jev question checks: probabilities are None when the check was skipped
+    # or failed. `out_of_scope` runs end straight after the scope check.
+    in_scope_probability: Optional[float] = None
+    out_of_scope: bool = False
+    pretzel_probability: Optional[float] = None
+    is_pretzel_question: bool = False
     is_agg_accession_query: bool = False
     needs_clarification: bool = False
     accessions: List[str] = Field(default_factory=list)
@@ -534,7 +593,19 @@ class ErrorEvent:
     state: RunState
 
 
-RunEvent = Union[StageChangeEvent, TextEvent, ReasoningEvent, ResultEvent, ErrorEvent]
+@dataclass
+class UiDataEvent:
+    """Structured data for the frontend to render inside the current
+    assistant message (AG-UI CUSTOM event -> assistant-ui `data` part),
+    e.g. the out-of-scope contact box or the Pretzel question box."""
+
+    name: str
+    value: dict
+
+
+RunEvent = Union[
+    StageChangeEvent, TextEvent, ReasoningEvent, ResultEvent, ErrorEvent, UiDataEvent
+]
 
 global_instruction_and_information = getPrompt("global_instruction_and_information")
 
@@ -565,6 +636,13 @@ class PlantBioRAG:
         # accession presentation) would otherwise pay for unused thinking
         # tokens.
         self._answer_llm_cache: Dict[Tuple[str, str], ChatGoogleGenerativeAI] = {}
+        jev_api_key = os.getenv("JEV_API_KEY", "").strip()
+        self._jev = (
+            TypeSafeClient(api_key=jev_api_key, model=JEV_MODEL, timeout=JEV_TIMEOUT_SECONDS)
+            if jev_api_key else None
+        )
+        if self._jev is None:
+            logger.warning("JEV_API_KEY is not set; Jev question scope and Pretzel checks are disabled.")
         self.graph = Neo4jGraph()
         self.vs = Neo4jVector(
             embedding=self.emb,
@@ -1811,6 +1889,39 @@ class PlantBioRAG:
             return thinking
         return PlantBioRAG._thinking_from_parts(getattr(resp, "content_blocks", None))
 
+    # Jev yes/no question checks. Each returns the probability of "yes" and
+    # records the request's token usage in `diagnostics["usage_metadata"]`.
+    # Callers treat a raised exception (or `self._jev is None`) as "skip".
+    def _jev_noul_probability(
+        self, state: dict, questions: dict, diagnostics: Optional[dict] = None,
+    ) -> float:
+        response = self._jev.system_one(state=state, questions=questions)
+        (question_id,) = questions
+        if diagnostics is not None:
+            input_tokens = response.usage.input_tokens or 0
+            output_tokens = response.usage.output_tokens or 0
+            diagnostics["model"] = response.model
+            diagnostics["usage_metadata"] = {
+                "input_tokens": input_tokens,
+                "output_tokens": output_tokens,
+                "total_tokens": input_tokens + output_tokens,
+            }
+        return response.answers[question_id].noul
+
+    def _jev_in_scope_probability(self, q: str, diagnostics: Optional[dict] = None) -> float:
+        return self._jev_noul_probability(
+            {"question": q, "assistant_scope": JEV_ASSISTANT_SCOPE},
+            JEV_SCOPE_QUESTIONS,
+            diagnostics,
+        )
+
+    def _jev_pretzel_how_to_probability(self, q: str, diagnostics: Optional[dict] = None) -> float:
+        return self._jev_noul_probability(
+            {"question": q, "pretzel": JEV_PRETZEL_DESCRIPTION},
+            JEV_PRETZEL_QUESTIONS,
+            diagnostics,
+        )
+
     # Question analysis and retrieval query expansion
     def expand_question_and_queries(
         self, q: str, diagnostics: Optional[dict] = None,
@@ -2413,6 +2524,9 @@ Input JSON:
         expanded_queries: List[str],
         k: int,
         taxon_filter: Optional[dict[str, Any]] = None,
+        # Set when Jev judged the question to be about using Pretzel; the
+        # keyword match below still applies so naming Pretzel always works.
+        include_pretzel: bool = False,
     ) -> Tuple[Optional[dict[str, Any]], str, str, dict[str, Any]]:
         source_errors = {}
         def safe_call(fn, label, *args):
@@ -2445,7 +2559,7 @@ Input JSON:
                 q,
             )
             pretzel_future = None
-            if "pretzel" in q.lower():
+            if include_pretzel or "pretzel" in q.lower():
                 pretzel_future = executor.submit(
                     safe_call, self._get_pretzel_context, "Pretzel", expanded_queries
                 )
@@ -2674,9 +2788,49 @@ Input JSON:
         token_tally: list[dict] = []
         query_started = time.perf_counter()
         try:
-            # Announce EXPANDING_QUESTION before the analysis LLM call, so the
+            # Announce EXPANDING_QUESTION before any model call, so the
             # frontend shows it while it runs (and drops the previous run's state).
             yield StageChangeEvent(state=state)
+
+            # Scope check runs (and finishes) before any Gemini call so an
+            # out-of-scope question costs one Jev request and nothing else.
+            # It has no stage of its own: the frontend doesn't display it.
+            # A failed check lets the question through.
+            in_scope_probability = None
+            if self._jev is not None:
+                scope_diagnostics: dict = {}
+                with log_step("Question scope check", 0, token_tally) as step:
+                    try:
+                        in_scope_probability = await asyncio.to_thread(
+                            self._jev_in_scope_probability, q, scope_diagnostics
+                        )
+                        logger.info("In-scope probability: %.3f", in_scope_probability)
+                    except Exception as e:
+                        logger.warning("Jev scope check failed; treating question as in scope: %s", e)
+                    step["model"] = scope_diagnostics.get("model")
+                    step["usage"] = scope_diagnostics.get("usage_metadata")
+            out_of_scope = (
+                in_scope_probability is not None
+                and in_scope_probability < JEV_IN_SCOPE_MIN_PROBABILITY
+            )
+            state = state.model_copy(
+                update={"in_scope_probability": in_scope_probability, "out_of_scope": out_of_scope}
+            )
+            if out_of_scope:
+                logger.info("Question judged out of scope; skipping the pipeline.")
+                yield TextEvent(text=OUT_OF_SCOPE_MESSAGE)
+                yield UiDataEvent(name="out_of_scope", value={"contactEmail": CONTACT_EMAIL})
+                yield ResultEvent(state=state.model_copy(update={"token_usage": summarise_token_tally(token_tally, time.perf_counter() - query_started)}))
+                return
+
+            # The Pretzel check is independent of question analysis, so it
+            # runs alongside it and is awaited once analysis is done.
+            pretzel_diagnostics: dict = {}
+            pretzel_task = None
+            if self._jev is not None:
+                pretzel_task = asyncio.create_task(asyncio.to_thread(
+                    self._jev_pretzel_how_to_probability, q, pretzel_diagnostics
+                ))
 
             # Classify before cache/retrieval so a direct AGG lookup can skip
             # GraphRAG when no suitable cached response exists.
@@ -2723,14 +2877,35 @@ Input JSON:
                         expanded_query,
                     )
 
+            pretzel_probability = None
+            if pretzel_task is not None:
+                try:
+                    pretzel_probability = await pretzel_task
+                    logger.info("Pretzel how-to probability: %.3f", pretzel_probability)
+                except Exception as e:
+                    logger.warning("Jev Pretzel check failed; using keyword match only: %s", e)
+                if pretzel_diagnostics.get("usage_metadata"):
+                    token_tally.append(_token_tally_entry(
+                        "Pretzel question check", pretzel_diagnostics.get("model"),
+                        pretzel_diagnostics["usage_metadata"],
+                    ))
+            is_pretzel_question = (
+                pretzel_probability is not None
+                and pretzel_probability >= JEV_PRETZEL_MIN_PROBABILITY
+            )
+
             state = state.model_copy(
                 update={
                     "expanded_question": expanded_question,
                     "species": species,
                     "is_agg_accession_query": is_agg_accession_query,
+                    "pretzel_probability": pretzel_probability,
+                    "is_pretzel_question": is_pretzel_question,
                 }
             )
             yield StageChangeEvent(state=state)
+            if is_pretzel_question:
+                yield UiDataEvent(name="pretzel_question", value={"docsUrl": PRETZEL_DOCS_URL})
 
             cached = None
             q_emb = None
@@ -2868,6 +3043,7 @@ Input JSON:
                         expanded_queries,
                         k,
                         taxon_filter,
+                        is_pretzel_question,
                     )
                 )
 

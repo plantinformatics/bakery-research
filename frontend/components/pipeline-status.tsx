@@ -139,7 +139,9 @@ function stageIndex(stage: string | undefined): number {
 export function PipelineStatus() {
   const state = useAgUiState<PlantBioRunState>();
   const isRunning = useAuiState((s) => s.thread.isRunning);
-  const current = stageIndex(state?.stage);
+  // Declined (out-of-scope) runs never entered the pipeline, so no stage
+  // is shown as reached; the token summary still covers the scope check.
+  const current = state?.out_of_scope ? -1 : stageIndex(state?.stage);
   const accessions = state?.accessions ?? [];
   const usageLabel = formatTokenUsage(state?.usage_metadata);
 
