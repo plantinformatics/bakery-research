@@ -3,6 +3,7 @@
 import { useEffect, useState } from "react";
 import modelConfig from "@/config/models.json";
 import { AGUI_OPTIONS_URL } from "@/lib/agent";
+import type { AppVersion } from "@/lib/version";
 
 export type ModelOptions = {
   models: string[];
@@ -18,6 +19,8 @@ export type ModelOptions = {
   defaultLiteratureContextChars: number;
   /** Pretzel documentation link (`Query.py`'s `PRETZEL_DOCS_URL`). */
   pretzelDocsUrl: string;
+  /** Git commit the backend process was started from; null until loaded. */
+  backendVersion: AppVersion | null;
 };
 
 /**
@@ -36,6 +39,7 @@ const FALLBACK_OPTIONS: ModelOptions = {
   literatureContextCharsStep: 10000,
   defaultLiteratureContextChars: 50000,
   pretzelDocsUrl: "https://docs.plantinformatics.io/",
+  backendVersion: null,
 };
 
 /** Fetches the selectable models/reasoning levels for `ModelSelector` from
@@ -70,6 +74,7 @@ export function useModelOptions(): ModelOptions {
             data.defaultLiteratureContextChars ??
             prev.defaultLiteratureContextChars,
           pretzelDocsUrl: data.pretzelDocsUrl ?? prev.pretzelDocsUrl,
+          backendVersion: data.backendVersion ?? prev.backendVersion,
         }));
       })
       .catch((err: unknown) => {

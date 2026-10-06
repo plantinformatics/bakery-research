@@ -2,8 +2,15 @@
 
 import { makeAssistantDataUI, useAuiState } from "@assistant-ui/react";
 import type { ThreadMessage } from "@assistant-ui/react";
-import { DownloadIcon, ExternalLinkIcon, MailIcon, MapIcon } from "lucide-react";
+import {
+  DownloadIcon,
+  ExternalLinkIcon,
+  MailIcon,
+  MapIcon,
+} from "lucide-react";
 import { Button } from "@/components/ui/button";
+import { useModelOptions } from "@/hooks/use-model-options";
+import { versionSummary } from "@/lib/version";
 
 /**
  * Renderers for the named `data` parts `GraphRAG/Query.py` attaches to an
@@ -32,10 +39,13 @@ function chatTranscript(messages: readonly ThreadMessage[]): string {
     .join("\n\n");
 }
 
-function downloadTranscript(transcript: string) {
-  const blob = new Blob([`# Bakery Research chat\n\n${transcript}\n`], {
-    type: "text/markdown",
-  });
+function downloadTranscript(transcript: string, version: string) {
+  const blob = new Blob(
+    [`# Bakery Research chat\n\n_${version}_\n\n${transcript}\n`],
+    {
+      type: "text/markdown",
+    },
+  );
   const url = URL.createObjectURL(blob);
   const link = document.createElement("a");
   link.href = url;
@@ -44,10 +54,16 @@ function downloadTranscript(transcript: string) {
   URL.revokeObjectURL(url);
 }
 
-function mailtoHref(email: string, transcript: string): string {
+function mailtoHref(
+  email: string,
+  transcript: string,
+  version: string,
+): string {
   const truncated = transcript.length > MAILTO_TRANSCRIPT_MAX_CHARS;
   const body = [
     "Hi, I asked the Bakery Research assistant a question it could not answer.",
+    "",
+    version,
     "",
     "Chat so far:",
     "",
@@ -68,6 +84,7 @@ type OutOfScopeData = { contactEmail?: string };
 function OutOfScopeContact({ data }: { data: OutOfScopeData }) {
   const messages = useAuiState((s) => s.thread.messages);
   const transcript = chatTranscript(messages);
+  const version = versionSummary(useModelOptions().backendVersion);
   const email = data.contactEmail?.trim();
 
   return (
@@ -81,7 +98,7 @@ function OutOfScopeContact({ data }: { data: OutOfScopeData }) {
       <div className="flex flex-wrap gap-2">
         {email ? (
           <Button asChild size="sm">
-            <a href={mailtoHref(email, transcript)}>
+            <a href={mailtoHref(email, transcript, version)}>
               <MailIcon />
               Email {email}
             </a>
@@ -90,7 +107,7 @@ function OutOfScopeContact({ data }: { data: OutOfScopeData }) {
         <Button
           size="sm"
           variant="outline"
-          onClick={() => downloadTranscript(transcript)}
+          onClick={() => downloadTranscript(transcript, version)}
         >
           <DownloadIcon />
           Download chat
@@ -115,8 +132,8 @@ function PretzelQuestion({ data }: { data: PretzelQuestionData }) {
       <span className="flex min-w-0 flex-1 flex-col">
         <span className="text-sm font-medium">Pretzel how-to question</span>
         <span className="text-xs text-sky-800 dark:text-sky-200">
-          This answer draws on the Pretzel documentation. Open the docs for
-          more detail.
+          This answer draws on the Pretzel documentation. Open the docs for more
+          detail.
         </span>
       </span>
       <ExternalLinkIcon className="size-4 shrink-0 text-sky-600 dark:text-sky-300" />
