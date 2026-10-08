@@ -427,7 +427,7 @@ LITERATURE_EXPANSION_SCORE_DISCOUNT = 0.5  # One-hop graph matches borrow only p
 EXACT_ENTITY_MATCH_K = 200  # Full-text candidates for terms explicitly named in the original question.
 EXACT_ENTITY_RRF_WEIGHT = 1.0  # Additional RRF contribution from exact entity lookup.
 RERANK_CANDIDATES_PER_QUERY = 3  # Preserve candidates from each generated query.
-RERANK_EXACT_ENTITY_SLOTS = 8  # Source-diverse exact matches protected in the judge pool.
+RERANK_EXACT_ENTITY_SLOTS = 20  # Source-diverse exact matches protected in the judge pool.
 RERANK_DIRECT_MATCH_SLOTS = 8  # Direct vector/full-text matches protected in the judge pool.
 RERANK_BATCH_SIZE = 16  # Batch size for the extra semantic-ranking calls.
 RERANK_MAX_CONCURRENT_BATCHES = 3  # Independent judge calls in flight; lower if API rate-limited.
@@ -489,7 +489,7 @@ CONTACT_EMAIL = os.getenv("CONTACT_EMAIL") or ""
 PRETZEL_DOCS_URL = os.getenv("PRETZEL_DOCS_URL") or "https://docs.plantinformatics.io/"
 
 # USER ADJUSTABLE VARIABLES 
-LITERATURE_CHUNKS_TO_RERANK = 48  # Maximum literature chunks sent to relevance ranking per request.
+LITERATURE_CHUNKS_TO_RERANK = 80  # Maximum literature chunks sent to relevance ranking per request.
 MAX_CHARACTERS = 50000  # The final size of the literature context sent to the LLM.
 
 # Accession API config
