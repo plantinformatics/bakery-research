@@ -436,7 +436,7 @@ RERANK_MAX_METADATA_CHARS = 3000  # Metadata scope shown to the evidence judge.
 RERANK_MODEL = "gemini-2.5-flash"  # Lower-cost model used only for literature relevance scoring.
 
 # USER ADJUSTABLE VARIABLES 
-LITERATURE_CHUNKS_TO_RERANK = 48  # Maximum literature chunks sent to relevance ranking per request.
+LITERATURE_CHUNKS_TO_RERANK = 80  # Maximum literature chunks sent to relevance ranking per request.
 MAX_CHARACTERS = 50000  # The final size of the literature context sent to the LLM.
 
 # Accession API config
