@@ -11,4 +11,4 @@ md_dir
 *.log
 schema.yaml
 PaperExtraction.py
-prompts/
+prompts
