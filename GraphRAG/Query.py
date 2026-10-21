@@ -1074,7 +1074,15 @@ class PlantBioRAG:
             "available": True,
         }
         query_hints = [query for query in expanded_queries if query != question][:12]
-        metadata_scope = metadata_context[:RERANK_MAX_METADATA_CHARS]
+        metadata_relationships = []
+        for line in metadata_context.splitlines():
+            try:
+                record = json.loads(line)
+            except (TypeError, json.JSONDecodeError):
+                continue
+            if isinstance(record, dict) and "relationship" in record:
+                metadata_relationships.append(line)
+        metadata_scope = "\n".join(metadata_relationships)[:RERANK_MAX_METADATA_CHARS]
         def make_prompt(batch):
             payload = [
                 {"id": index, "source": item.get("source_path", ""),
