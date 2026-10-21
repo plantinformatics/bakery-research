@@ -417,8 +417,12 @@ QUERY_FULL_TEXT_MAX_CHUNKS = 40
 QUERY_MAX_CHUNKS = 80  # Maximum RRF-ranked literature chunks per expanded query.
 # Bounds/step for the literature context budget the frontend can select
 # per run (see `_resolve_max_context_chars`); exposed via `GET /options`.
+# The maximum matches the largest relevance judge pool
+# (`LITERATURE_CHUNKS_TO_RERANK_MAX` chunks of about
+# `LITERATURE_CONTEXT_CHARS_PER_RERANK_CHUNK` characters), as a larger budget
+# could not be filled.
 MIN_LITERATURE_CONTEXT_CHARS = 10000
-MAX_LITERATURE_CONTEXT_CHARS = 500000
+MAX_LITERATURE_CONTEXT_CHARS = 180000
 LITERATURE_CONTEXT_CHARS_STEP = 10000
 MAX_TRIPLES = 50
 LITERATURE_TRIPLE_MAX_CHARACTERS = 5000  # Separate budget for literature relationships.
@@ -489,7 +493,14 @@ CONTACT_EMAIL = os.getenv("CONTACT_EMAIL") or ""
 PRETZEL_DOCS_URL = os.getenv("PRETZEL_DOCS_URL") or "https://docs.plantinformatics.io/"
 
 # USER ADJUSTABLE VARIABLES 
-LITERATURE_CHUNKS_TO_RERANK = 80  # Maximum literature chunks sent to relevance ranking per request.
+# The literature context budget (the frontend's slider) also sets how many
+# chunks are sent to relevance ranking: one chunk per
+# `LITERATURE_CONTEXT_CHARS_PER_RERANK_CHUNK` characters of budget, kept within
+# these bounds. A larger pool means more relevance judge calls
+# (`RERANK_BATCH_SIZE` chunks each).
+LITERATURE_CHUNKS_TO_RERANK_MIN = 48
+LITERATURE_CHUNKS_TO_RERANK_MAX = 180
+LITERATURE_CONTEXT_CHARS_PER_RERANK_CHUNK = 1000  # About the rendered size of one literature chunk.
 MAX_CHARACTERS = 50000  # The final size of the literature context sent to the LLM.
 
 # Accession API config
@@ -1470,6 +1481,13 @@ class PlantBioRAG:
         rrf_ranked = candidates["rrf_ranked"]
         candidate_ranked = candidates["candidate_ranked"]
         pool_started = time.perf_counter()
+        rerank_pool_limit = min(
+            LITERATURE_CHUNKS_TO_RERANK_MAX,
+            max(
+                LITERATURE_CHUNKS_TO_RERANK_MIN,
+                -(-max_context_chars // LITERATURE_CONTEXT_CHARS_PER_RERANK_CHUNK),
+            ),
+        )
         eligible_chunks = [item for item in all_chunks if item.get("rejection_reason") is None]
         eligible_object_ids = {id(item) for item in eligible_chunks}
         rerank_pool: list[dict[str, Any]] = []
@@ -1489,7 +1507,7 @@ class PlantBioRAG:
             )
             for item in query_ranked[:RERANK_CANDIDATES_PER_QUERY]:
                 identity = item.get("chunk_id") or id(item)
-                if identity not in pool_ids and len(rerank_pool) < LITERATURE_CHUNKS_TO_RERANK:
+                if identity not in pool_ids and len(rerank_pool) < rerank_pool_limit:
                     pool_ids.add(identity)
                     rerank_pool.append(item)
                     item["pool_selection_reason"] = "Expanded query coverage"
@@ -1498,7 +1516,7 @@ class PlantBioRAG:
         seen_sources = {item.get("source_path") for item in rerank_pool}
         for source_diversity in (True, False):
             for item in exact_candidates:
-                if exact_added >= RERANK_EXACT_ENTITY_SLOTS or len(rerank_pool) >= LITERATURE_CHUNKS_TO_RERANK:
+                if exact_added >= RERANK_EXACT_ENTITY_SLOTS or len(rerank_pool) >= rerank_pool_limit:
                     break
                 identity = item.get("chunk_id") or id(item)
                 source = item.get("source_path")
@@ -1511,7 +1529,7 @@ class PlantBioRAG:
                 exact_added += 1
         direct_added = 0
         for item in candidate_ranked:
-            if direct_added >= RERANK_DIRECT_MATCH_SLOTS or len(rerank_pool) >= LITERATURE_CHUNKS_TO_RERANK:
+            if direct_added >= RERANK_DIRECT_MATCH_SLOTS or len(rerank_pool) >= rerank_pool_limit:
                 break
             identity = item.get("chunk_id") or id(item)
             if id(item) in eligible_object_ids and item.get("retrieval_origin") in ("direct", "direct_and_expanded") and identity not in pool_ids:
@@ -1520,7 +1538,7 @@ class PlantBioRAG:
                 item["pool_selection_reason"] = "Direct search match"
                 direct_added += 1
         for item in candidate_ranked:
-            if len(rerank_pool) >= LITERATURE_CHUNKS_TO_RERANK:
+            if len(rerank_pool) >= rerank_pool_limit:
                 break
             identity = item.get("chunk_id") or id(item)
             if id(item) in eligible_object_ids and identity not in pool_ids:
@@ -1530,7 +1548,10 @@ class PlantBioRAG:
         reranker_error = None
         pool_ids_in_order = [item["diagnostic_id"] for item in rerank_pool]
         pool_seconds = time.perf_counter() - pool_started
-        logger.debug("Literature candidate pool selection: %.2fs (%d chunks)", pool_seconds, len(rerank_pool))
+        logger.debug(
+            "Literature candidate pool selection: %.2fs (%d of up to %d chunks)",
+            pool_seconds, len(rerank_pool), rerank_pool_limit,
+        )
         reranker_started = time.perf_counter()
         try:
             rerank_results = self._semantic_rerank_chunks(
@@ -1690,7 +1711,7 @@ class PlantBioRAG:
                 "model": RERANK_MODEL,
                 "candidate_count": len(eligible_chunks),
                 "scored_count": scored_count,
-                "candidate_limit": LITERATURE_CHUNKS_TO_RERANK,
+                "candidate_limit": rerank_pool_limit,
                 "exact_entity_slots": RERANK_EXACT_ENTITY_SLOTS,
                 "direct_match_slots": RERANK_DIRECT_MATCH_SLOTS,
                 "minimum_score": RERANK_MIN_SCORE,
