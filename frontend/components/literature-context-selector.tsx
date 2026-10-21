@@ -19,7 +19,8 @@ function formatChars(chars: number): string {
 
 /**
  * Composer button that opens a slider for the literature context character
- * budget (`max_context_chars` in `PlantBioRAG.query()`, `GraphRAG/Query.py`).
+ * budget (`max_context_chars` in `PlantBioRAG.query()`, `GraphRAG/Query.py`),
+ * which also sizes the relevance judge's candidate pool.
  * Bounds/default come from the backend (`useModelOptions`). The value is
  * registered with assistant-ui's `ModelContext` as
  * `config.maxLiteratureContextChars`, which `AgUiThreadRuntimeCore.
@@ -97,6 +98,10 @@ export function LiteratureContextSelector() {
             <span>≈ {formatChars(Math.round(chars / 4))} tokens</span>
             <span>{formatChars(max)}</span>
           </div>
+          <p className="text-muted-foreground text-xs">
+            Higher values also check more literature passages for relevance,
+            so answers take longer and cost more.
+          </p>
           <Button
             type="button"
             variant="outline"
