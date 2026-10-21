@@ -408,7 +408,7 @@ METADATA_RRF_MIN_ABSOLUTE_DROP = 0.005  # Minimum absolute drop as well as relat
 METADATA_MAX_RESULTS_AFTER_RRF = 40  # Hard cap after applying the elbow cutoff.
 METADATA_NEIGHBORS_PER_SEED = 2  # Maximum adjacent metadata nodes per selected seed.
 METADATA_MAX_TRIPLES = 50  # Maximum relationship descriptions included in metadata context.
-METADATA_MAX_CONTEXT_CHARS = 20000  # Character budget for metadata context.
+METADATA_MAX_CONTEXT_CHARS = 30000  # Character budget for metadata context.
 
 # Literature/Pretzel retrieval defaults; vector and full-text limits are per query.
 QUERY_VECTOR_MAX_CHUNKS = 40
@@ -2206,10 +2206,17 @@ Input JSON:
             top_nids, taxon_filter, METADATA_NEIGHBORS_PER_SEED
         )
         all_chunks_deduplicated = self._dedupe_chunks(seeded_chunks + expanded_chunks)
-        deduped_nids = [
+        expanded_nids = [
             c.get("chunk_id") for c in all_chunks_deduplicated if c.get("chunk_id")
         ]
-        fetch_nids = deduped_nids or top_nids
+        # Keep the direct hybrid-search matches in relevance order, then add
+        # their one-hop neighbors. This ordering applies uniformly to every
+        # metadata question and leaves the relationship descriptions until
+        # after the node records have used the context budget.
+        top_nid_set = set(top_nids)
+        fetch_nids = top_nids + [nid for nid in expanded_nids if nid not in top_nid_set]
+        if not fetch_nids:
+            fetch_nids = top_nids
         res = self.graph.query(
             """
             UNWIND range(0, size($nids) - 1) AS i
@@ -2221,14 +2228,9 @@ Input JSON:
             """,
             params={"nids": fetch_nids},
         )
-        # Limit by max_chars.
+        # Write dataset records before graph edges so the context budget keeps
+        # the directly matching data even when many relationships are found.
         context_parts, total_chars = [], 0
-        for t in triples[:METADATA_MAX_TRIPLES]:
-            text = json.dumps({"relationship": t}, ensure_ascii=False)
-            if total_chars + len(text) > max_chars:
-                return "\n".join(context_parts)
-            context_parts.append(text)
-            total_chars += len(text)
         for r in res:
             props = {
                 k: v
@@ -2236,6 +2238,12 @@ Input JSON:
                 if k != "embedding" and v is not None
             }
             text = json.dumps(props)
+            if total_chars + len(text) > max_chars:
+                break
+            context_parts.append(text)
+            total_chars += len(text)
+        for t in triples[:METADATA_MAX_TRIPLES]:
+            text = json.dumps({"relationship": t}, ensure_ascii=False)
             if total_chars + len(text) > max_chars:
                 break
             context_parts.append(text)
