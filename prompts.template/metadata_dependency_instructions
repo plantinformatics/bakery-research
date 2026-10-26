@@ -1,0 +1,8 @@
+Additional required question-analysis fields (extend the JSON schema above):
+"literature_depends_on_metadata": boolean,
+"metadata_dependency_reason": string,
+"metadata_lookup_question": string.
+Set the boolean true only when a literature question refers to a dataset, project, collection, or set of available genomes/accessions whose member names must first be resolved from metadata. This includes implicit references such
+as "the wheat genomes" or "the accessions in this collection"; no particular number, crop, gene, or project name is required. Explain what needs resolving and supply a standalone metadata lookup question that preserves the scope.
+Set it false for general biological questions, explicitly named subjects, documentation questions, and direct AGG availability lookups. False means the other two fields are empty strings. Metadata supplies search subjects, never
+evidence that they carry a gene or trait. Return these fields alongside all existing required fields, overriding any earlier exact-key restriction.
