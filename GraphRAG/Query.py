@@ -31,6 +31,13 @@ from rich.logging import RichHandler
 from typesafe_sdk import Noul, TypeSafeClient
 
 from getPrompt import getPrompt
+from literature_read_cache import LiteratureReadCache
+from metadata_category_selection import category_metadata_context
+from metadata_query_grounding import ground_literature_queries, matching_subjects
+from literature_subject_scope import (subject_questions, parse_subject_assessments,
+                                      scope_relationships, subject_coverage,
+                                      relationship_scope_filter, RELEVANCE_BOOST_RELATIONS,
+                                      derive_subject_assessments)
 from literature_graph_expansion import expand_literature_graph
 from literature_candidate_ranking import extract_literature_entity_terms, literature_candidate_sort_key, score_literature_candidate_texts, score_literature_candidate_vectors
 from taxon_filter import metadata_matches_taxon, resolve_taxon_filter, taxon_regex, text_is_clearly_other_taxon
@@ -414,7 +421,7 @@ METADATA_MAX_CONTEXT_CHARS = 30000  # Character budget for metadata context.
 # Literature/Pretzel retrieval defaults; vector and full-text limits are per query.
 QUERY_VECTOR_MAX_CHUNKS = 40
 QUERY_FULL_TEXT_MAX_CHUNKS = 40
-QUERY_MAX_CHUNKS = 80  # Maximum RRF-ranked literature chunks per expanded query.
+QUERY_MAX_CHUNKS = 100  # Maximum RRF-ranked literature chunks per expanded query.
 # Bounds/step for the literature context budget the frontend can select
 # per run (see `_resolve_max_context_chars`); exposed via `GET /options`.
 # The maximum matches the largest relevance judge pool
@@ -437,6 +444,7 @@ RERANK_BATCH_SIZE = 16  # Batch size for the extra semantic-ranking calls.
 RERANK_MAX_CONCURRENT_BATCHES = 3  # Independent judge calls in flight; lower if API rate-limited.
 RERANK_MISSING_RETRY_LIMIT = 1  # Retry only passages omitted or malformed in judge responses.
 RERANK_MIN_SCORE = 2.0  # Exclude topic-only mentions; allow indirect and direct evidence.
+LITERATURE_UNJUDGED_FALLBACK_CHUNKS = 12  # Unscored passages kept, in search order, when the judge fails.
 RERANK_MAX_METADATA_CHARS = 3000  # Metadata scope shown to the evidence judge.
 RERANK_MODEL = "gemini-2.5-flash"  # Lower-cost model used only for literature relevance scoring.
 
@@ -819,6 +827,8 @@ class PlantBioRAG:
         original_question: str,
         taxon_filter: Optional[dict[str, Any]] = None,
         query_label: str = "query",
+        priority_entities: Optional[list[str]] = None,
+        read_cache=None,
     ) -> dict:
         query_started = time.perf_counter()
         search_trace = {}
@@ -830,9 +840,23 @@ class PlantBioRAG:
         search_trace["exact_entity_terms"] = []
         search_trace.setdefault("ranking", {})["exact_entity"] = []
         if expanded_query == original_question:
-            for term in extract_literature_entity_terms(original_question):
-                exact_scores = self._fulltext_chunks(term, EXACT_ENTITY_MATCH_K, exact_phrase=True)
-                search_trace["exact_entity_terms"].append(term)
+            ordinary_terms = extract_literature_entity_terms(original_question)
+            unique_priority_entities = matching_subjects(expanded_query, priority_entities or [])
+            priority_limit = max(
+                1, min(EXACT_ENTITY_MATCH_K, k // max(1, len(unique_priority_entities)))
+            )
+            exact_searches = [
+                (term, self._fulltext_chunks(term, EXACT_ENTITY_MATCH_K, exact_phrase=True), "question")
+                for term in ordinary_terms
+            ]
+            exact_searches.extend(
+                (term, self._fulltext_chunks(term, priority_limit, exact_phrase=True), "metadata_subject")
+                for term in unique_priority_entities
+            )
+            search_trace["exact_entity_terms"] = list(dict.fromkeys(
+                ordinary_terms + unique_priority_entities
+            ))
+            for term, exact_scores, source in exact_searches:
                 for rank, (cid, score) in enumerate(
                     sorted(exact_scores.items(), key=lambda item: item[1], reverse=True), start=1
                 ):
@@ -840,7 +864,7 @@ class PlantBioRAG:
                     fused[cid] = fused.get(cid, 0.0) + contribution
                     exact_entity_ids.add(cid)
                     search_trace["ranking"]["exact_entity"].append({
-                        "term": term, "chunk_id": cid, "score": score,
+                        "term": term, "source": source, "chunk_id": cid, "score": score,
                         "rank": rank, "rrf_contribution": contribution,
                     })
             search_trace["ranking"]["rrf"] = [
@@ -857,15 +881,33 @@ class PlantBioRAG:
                 for score, ids in groups.items() if len(ids) > 1
             ]
         ranked_cids = sorted(fused, key=lambda cid: (-fused[cid], cid))
-        candidate_rows = self.graph.query(
+        if read_cache is None:
+            read_cache = LiteratureReadCache()
+        candidate_rows = read_cache.read_many("texts", ranked_cids, lambda missing: self.graph.query(
             """
             MATCH (c:Chunk) WHERE c.chunk_id IN $cids
             RETURN c.chunk_id AS chunk_id, c.source_path AS source_path,
                    c.text AS text
             """,
-            params={"cids": ranked_cids},
-        ) if ranked_cids else []
+            params={"cids": missing},
+        ), "chunk_id") if ranked_cids else []
         candidate_by_id = {row["chunk_id"]: row for row in candidate_rows}
+        cohort_matches = {
+            cid: matching_subjects(str(row.get("text", "")), priority_entities or [])
+            for cid, row in candidate_by_id.items()
+        }
+        if priority_entities:
+            ranked_cids.sort(key=lambda cid: (
+                not bool(cohort_matches.get(cid)), -len(cohort_matches.get(cid, [])),
+                -fused.get(cid, 0.0), cid,
+            ))
+            search_trace["cohort_priority"] = {
+                "subjects": priority_entities,
+                "matched_chunk_count": sum(bool(names) for names in cohort_matches.values()),
+                "matched_chunks_in_seed_cut": sum(
+                    bool(cohort_matches.get(cid)) for cid in ranked_cids[:k]
+                ),
+            }
         taxonomy_rejected_ids = {
             cid for cid in ranked_cids
             if cid in candidate_by_id
@@ -875,29 +917,41 @@ class PlantBioRAG:
         seed_cids = eligible_ranked_cids[:k]
         outside_top_k_ids = eligible_ranked_cids[k:]
         hybrid_search_seconds = time.perf_counter() - query_started
+        logger.info("Literature [%s]: search ready in %.1fs; expanding %d seeds",
+                    query_label, hybrid_search_seconds, len(seed_cids))
+        seed_ids_by_expanded_chunk: dict[Any, set[str]] = {}
         seeded_chunks, expanded_chunks, triples, expansion_timings = expand_literature_graph(
-            self.graph, seed_cids, [candidate_by_id[cid] for cid in seed_cids if cid in candidate_by_id]
+            self.graph, seed_cids, [candidate_by_id[cid] for cid in seed_cids if cid in candidate_by_id],
+            read_cache=read_cache, provenance=seed_ids_by_expanded_chunk,
+            keep_relationship=relationship_scope_filter(priority_entities),
         )
-        logger.debug(
-            'Literature query [%s] "%s": %.2fs = hybrid search %.2fs (%d seeds) + graph neighbours %.2fs (%d neighbour chunks, %d triples)',
+        logger.info(
+            'Literature query [%s] "%s": %.2fs = hybrid search %.2fs (%d seeds) + graph neighbours %.2fs (%d neighbour chunks, %d relationship-neighbour combinations)',
             query_label, expanded_query,
             hybrid_search_seconds + expansion_timings["total_seconds"],
             hybrid_search_seconds, expansion_timings.get("seed_count", 0),
             expansion_timings["total_seconds"], expansion_timings.get("neighbor_count", 0),
             expansion_timings.get("triple_count", 0),
         )
+        logger.info("Literature [%s]: %d unique seed-neighbour links used for provenance (%d relationship-neighbour combinations)",
+                    query_label, expansion_timings.get("unique_seed_neighbor_links", 0),
+                    expansion_timings.get("triple_count", 0))
+        # Fetch stages share in-flight reads across queries, so a stage can include
+        # time spent waiting for another query's identical fetch.
+        logger.info("Literature [%s] graph expansion stages: relations %.2fs, neighbour links %.2fs, "
+                    "neighbour texts %.2fs, triple assembly %.2fs; relationships kept %d of %d",
+                    query_label, expansion_timings.get("relation_fetch_seconds", 0.0),
+                    expansion_timings.get("neighbor_link_fetch_seconds", 0.0),
+                    expansion_timings.get("neighbor_text_fetch_seconds", 0.0),
+                    expansion_timings.get("triple_assembly_seconds", 0.0),
+                    expansion_timings.get("relationship_edges_kept", 0),
+                    expansion_timings.get("relationship_edges_total", 0))
         search_trace["graph_expansion"] = expansion_timings
         postprocess_started = time.perf_counter()
         all_chunks = self._dedupe_chunks(seeded_chunks + expanded_chunks)
         expanded_chunk_scores: dict[str, float] = {}
-        seed_ids_by_expanded_chunk: dict[Any, set[str]] = {}
-        for triple in triples:
-            seed_id = triple.get("seed_chunk_id")
-            for expanded_id in triple.get("expanded_chunk_ids", [triple.get("expanded_chunk_id")]):
-                if seed_id:
-                    seed_ids_by_expanded_chunk.setdefault(expanded_id, set()).add(seed_id)
-                if expanded_id and seed_id:
-                    expanded_chunk_scores[expanded_id] = max(expanded_chunk_scores.get(expanded_id, 0.0), fused.get(seed_id, 0.0))
+        for expanded_id, seed_ids in seed_ids_by_expanded_chunk.items():
+            expanded_chunk_scores[expanded_id] = max(fused.get(seed_id, 0.0) for seed_id in seed_ids)
         provenance_index_seconds = time.perf_counter() - postprocess_started
 
         candidates = []
@@ -908,6 +962,7 @@ class PlantBioRAG:
                 "chunk_id": cid, "source_path": row.get("source_path", ""),
                 "text": row.get("text", ""), "rrf_score": fused[cid],
                 "exact_entity_match": cid in exact_entity_ids,
+                "cohort_match_entities": cohort_matches.get(cid, []),
                 "included": False,
                 "rejection_reason": "Clearly identified as a different taxonomy",
             })
@@ -920,6 +975,7 @@ class PlantBioRAG:
                     "chunk_id": cid, "source_path": row.get("source_path", ""),
                     "text": row["text"], "rrf_score": fused[cid],
                     "exact_entity_match": cid in exact_entity_ids,
+                    "cohort_match_entities": cohort_matches.get(cid, []),
                     "included": False, "rejection_reason": "Outside RRF top-K",
                 })
         for chunk in all_chunks:
@@ -932,6 +988,7 @@ class PlantBioRAG:
                 "text": text,
                 "rrf_score": fused.get(chunk_id, expanded_chunk_scores.get(chunk_id)),
                 "exact_entity_match": chunk_id in exact_entity_ids,
+                "cohort_match_entities": cohort_matches.get(chunk_id, []),
                 "is_direct_search_match": chunk_id in fused,
                 "rejection_reason": (
                     "Clearly identified as a different taxonomy"
@@ -970,6 +1027,7 @@ class PlantBioRAG:
 
         relationship_dedup_started = time.perf_counter()
         triple_by_text: dict[str, dict[str, Any]] = {}
+        relationship_scores = {}
         for triple in triples:
             text = triple["text"]
             seed_id = triple.get("seed_chunk_id")
@@ -981,9 +1039,10 @@ class PlantBioRAG:
                 or (bool(current["rejection_reason"]) == taxonomy_rejected
                     and score > current["rrf_score"])
             ):
-                relevance_score = current["relevance_score"] if current is not None else self._triple_relevance_score(
-                    original_question, re.sub(r"^\[Source: .*?\]\s*", "", text)
-                )
+                relationship = re.sub(r"^\[Source: .*?\]\s*", "", text)
+                if relationship not in relationship_scores:
+                    relationship_scores[relationship] = self._triple_relevance_score(original_question, relationship)
+                relevance_score = relationship_scores[relationship]
                 triple_by_text[text] = {
                     "text": text, "rrf_score": score,
                     "relevance_score": relevance_score,
@@ -999,7 +1058,7 @@ class PlantBioRAG:
             "total_seconds": time.perf_counter() - postprocess_started,
         }
         search_trace["post_expansion_processing"] = postprocess_timings
-        logger.debug(
+        logger.info(
             'Literature post-expansion [%s] "%s": %.2fs (provenance index %.2fs, candidates %.2fs, relationship dedup %.2fs)',
             query_label, expanded_query, postprocess_timings["total_seconds"],
             postprocess_timings["provenance_index_seconds"],
@@ -1064,6 +1123,8 @@ class PlantBioRAG:
     ) -> dict[str, dict[str, Any]]:
         """Judge answer evidence in small batches with the dedicated reranker LLM."""
         results: dict[str, dict[str, Any]] = {}
+        judge_item_rejections: Counter = Counter()  # why returned items were discarded
+        invalid_item_samples: list[str] = []
         self._chunk_reranker_usage.batches = []
         self._chunk_reranker_usage.value = {
             "model": RERANK_MODEL,
@@ -1086,7 +1147,8 @@ class PlantBioRAG:
         def make_prompt(batch):
             payload = [
                 {"id": index, "source": item.get("source_path", ""),
-                 "text": item.get("text", "")[:RERANK_MAX_TEXT_CHARS]}
+                 "text": item.get("text", "")[:RERANK_MAX_TEXT_CHARS],
+                 "subject_questions": item.get("subject_questions", {})}
                 for index, item in enumerate(batch)
             ]
             return getPrompt("literature_relevance_judge").rstrip() + "\n" + json.dumps(
@@ -1137,14 +1199,33 @@ class PlantBioRAG:
                         continue
                     score = max(0.0, min(4.0, score))
                 except (KeyError, TypeError, ValueError):
+                    judge_item_rejections["Invalid passage id or score"] += 1
+                    if len(invalid_item_samples) < 2:
+                        invalid_item_samples.append(json.dumps(item, ensure_ascii=False)[:300])
                     continue
                 candidate = batch[index]
+                questions = candidate.get("subject_questions", {})
+                assessments_derived = False
+                try:
+                    assessments = parse_subject_assessments(item, questions)
+                except ValueError as error:
+                    # The judge scored the passage but skipped or garbled the per-subject
+                    # scores. Keep its overall score instead of discarding the passage.
+                    judge_item_rejections[f"{error} (kept overall score)"] += 1
+                    assessments = derive_subject_assessments(score, item.get("entities"), questions)
+                    assessments_derived = True
+                if assessments and not assessments_derived:
+                    score = max(row["score"] for row in assessments.values())
                 entities = item.get("entities", [])
                 if not isinstance(entities, list):
                     entities = []
+                if assessments:
+                    entities = [subject for subject, row in assessments.items() if row["score"] >= RERANK_MIN_SCORE]
                 reason = item.get("reason", "")
                 results[str(candidate.get("chunk_id") or id(candidate))] = {
                     "semantic_score": score,
+                    "subject_assessments": assessments,
+                    "subject_assessments_derived": assessments_derived,
                     "semantic_reason": reason.strip() if isinstance(reason, str) else "",
                     "evidence_entities": sorted({
                         " ".join(entity.split()) for entity in entities
@@ -1219,6 +1300,24 @@ class PlantBioRAG:
                     record_response(batch, batch_trace, response, started)
                 except Exception as error:
                     batch_trace.update({"status": "parse_failed", "error": str(error)})
+        if len(results) < len(candidates) or judge_item_rejections:
+            # Diagnostics only: explain missing or derived judge scores.
+            batches = self._chunk_reranker_usage.batches
+            logger.warning(
+                "Literature judge diagnostics: batch outcomes %s; finish reasons %s; "
+                "passage result issues %s; errors %s; invalid item samples %s",
+                dict(Counter(trace.get("status") for trace in batches)),
+                dict(Counter(str((trace.get("response_metadata") or {}).get("finish_reason"))
+                             for trace in batches if "response_metadata" in trace)),
+                dict(judge_item_rejections),
+                [trace["error"] for trace in batches if trace.get("error")][:3],
+                invalid_item_samples,
+            )
+            sample = next((trace for trace in batches
+                           if trace.get("status") in ("parse_failed", "partial") and trace.get("raw_response")), None)
+            if sample:
+                logger.warning("Literature judge sample response (batch %s, status %s): %s",
+                               sample.get("batch"), sample.get("status"), sample["raw_response"][:1500])
         return results
 
     @staticmethod
@@ -1254,10 +1353,7 @@ class PlantBioRAG:
             source_question = matches_question(source)
             target_question = matches_question(target)
             parsed.append((item, source_norm, target_norm, normalized_type))
-            if normalized_type not in {
-                "PLEIOTROPICTO", "CONFERSRESISTANCETO", "CARRIES", "CARRIESGENE",
-                "HASGENE", "LOCATEDON", "ASSOCIATEDWITH", "ASSOCIATEDWITHTRAIT",
-            }:
+            if normalized_type not in RELEVANCE_BOOST_RELATIONS:
                 continue
             if source_question and not target_question:
                 bridge_entities.add(target_norm)
@@ -1265,10 +1361,9 @@ class PlantBioRAG:
                 bridge_entities.add(source_norm)
 
         for item, source, target, normalized_type in parsed:
-            if normalized_type in {
-                "PLEIOTROPICTO", "CONFERSRESISTANCETO", "CARRIES", "CARRIESGENE",
-                "HASGENE", "LOCATEDON", "ASSOCIATEDWITH", "ASSOCIATEDWITHTRAIT",
-            } and (source in bridge_entities or target in bridge_entities):
+            if normalized_type in RELEVANCE_BOOST_RELATIONS and (
+                source in bridge_entities or target in bridge_entities
+            ):
                 item["relevance_score"] += 10.0
 
     # Stage: RETRIEVING_CONTEXT. Run all expanded literature searches
@@ -1279,6 +1374,7 @@ class PlantBioRAG:
         self, expanded_queries: list[str], k: int,
         taxon_filter: Optional[dict[str, Any]] = None,
         original_question: Optional[str] = None,
+        priority_entities: Optional[list[str]] = None,
     ) -> Optional[dict[str, Any]]:
         if not expanded_queries:
             return None
@@ -1288,25 +1384,31 @@ class PlantBioRAG:
         deduplicated: dict[str, dict[str, Any]] = {}
         searches = {}
         completion_order = []
-        with ThreadPoolExecutor(max_workers=min(8, len(expanded_queries))) as executor:
+        read_cache = LiteratureReadCache()
+        with ThreadPoolExecutor(max_workers=min(10, len(expanded_queries))) as executor:
             futures = {
                 executor.submit(
                     self._search_literature_one_query,
                     query,
                     k,
-                    relevance_question,
+                    query if priority_entities else relevance_question,
                     taxon_filter,
                     query_label=(
                         "original" if index == 0 and original_question
                         and " ".join(query.split()).casefold() == " ".join(original_question.split()).casefold()
                         else f"expanded {index}/{len(expanded_queries) - 1}"
                     ),
+                    priority_entities=priority_entities,
+                    read_cache=read_cache,
                 ): query for index, query in enumerate(expanded_queries)
             }
             for future in as_completed(futures):
                 query = futures[future]
                 result = future.result()
                 completion_order.append(query)
+                logger.info("Literature search completed %d/%d (%.1fs): %s",
+                            len(completion_order), len(expanded_queries),
+                            time.perf_counter() - literature_started, query)
                 searches[query] = result["search_trace"]
                 for item in result["diagnostics"]["chunks"]:
                     chunk_id = item.get("chunk_id")
@@ -1365,12 +1467,32 @@ class PlantBioRAG:
                         current["rejection_reason"] = None
                 result["diagnostics"]["triples"] = []
 
+        shared_processing = {
+            "seed_uses_across_queries": sum(len(trace.get("seed_chunk_ids", [])) for trace in searches.values()),
+            "unique_seeds_processed": len({cid for trace in searches.values() for cid in trace.get("seed_chunk_ids", [])}),
+        }
+        shared_processing["reused_seed_expansions"] = (
+            shared_processing["seed_uses_across_queries"] - shared_processing["unique_seeds_processed"]
+        )
+        logger.info("Shared literature processing: %d seed uses, %d unique seeds processed, %d reused expansions",
+                    shared_processing["seed_uses_across_queries"], shared_processing["unique_seeds_processed"],
+                    shared_processing["reused_seed_expansions"])
         search_seconds = time.perf_counter() - literature_started
         logger.info(
             "Literature retrieval, %d %s in parallel: %.2fs wall",
             len(expanded_queries), "query" if len(expanded_queries) == 1 else "queries", search_seconds,
         )
         all_chunks = list(chunks_by_id.values())
+        if priority_entities:
+            for item in all_chunks:
+                item["cohort_match_entities"] = matching_subjects(
+                    str(item.get("text", "")), priority_entities
+                )
+            logger.info(
+                "Metadata cohort priority: %d/%d literature candidates mention a resolved subject",
+                sum(bool(item.get("cohort_match_entities")) for item in all_chunks),
+                len(all_chunks),
+            )
         lexical_started = time.perf_counter()
         score_literature_candidate_texts(all_chunks, relevance_question, expanded_queries)
         lexical_seconds = time.perf_counter() - lexical_started
@@ -1422,7 +1544,11 @@ class PlantBioRAG:
             item["rrf_rank"] = rank
         candidate_ranked = sorted(
             all_chunks,
-            key=lambda item: literature_candidate_sort_key(item, item.get("candidate_score")),
+            key=lambda item: (
+                not bool(item.get("cohort_match_entities")),
+                -len(item.get("cohort_match_entities", [])),
+                literature_candidate_sort_key(item, item.get("candidate_score")),
+            ),
         )
         for rank, item in enumerate(candidate_ranked, start=1):
             item["candidate_rank"] = rank
@@ -1445,6 +1571,7 @@ class PlantBioRAG:
         )
         return {
             "relevance_question": relevance_question,
+            "priority_entities": priority_entities or [],
             "expanded_queries": expanded_queries,
             "chunks": all_chunks,
             "rrf_ranked": rrf_ranked,
@@ -1454,6 +1581,7 @@ class PlantBioRAG:
                 "question_used_for_relevance": relevance_question,
                 "expanded_queries_in_input_order": expanded_queries,
                 "query_completion_order": completion_order,
+                "shared_graph_processing": shared_processing,
                 "combined_rrf_ids_in_rank_order": [item.get("chunk_id") for item in rrf_ranked],
                 "combined_rrf_ties": [
                     {"score": score, "chunk_ids_in_rank_order": ids}
@@ -1497,6 +1625,19 @@ class PlantBioRAG:
             ),
         )
         eligible_chunks = [item for item in all_chunks if item.get("rejection_reason") is None]
+        if candidates.get("priority_entities"):
+            # Reserve the judge budget for named subjects. Keep only a small
+            # background allowance for indirect gene/locus interpretation.
+            background = [item for item in candidate_ranked
+                          if item.get("rejection_reason") is None
+                          and not item.get("cohort_match_entities")][:3]
+            background_ids = {id(item) for item in background}
+            for item in eligible_chunks:
+                if not item.get("cohort_match_entities") and id(item) not in background_ids:
+                    item["rejection_reason"] = "Outside resolved subject scope (background allowance exhausted)"
+            eligible_chunks = [item for item in eligible_chunks if item.get("rejection_reason") is None]
+            logger.info("Literature subject filter: %d subject passages and %d background passages eligible for judge",
+                        len(eligible_chunks) - len(background), len(background))
         eligible_object_ids = {id(item) for item in eligible_chunks}
         rerank_pool: list[dict[str, Any]] = []
         pool_ids = set()
@@ -1506,11 +1647,13 @@ class PlantBioRAG:
                     path.get("query") == query and path.get("per_query_candidate_score") is not None
                     for path in item.get("retrieval_queries", [])
                 )),
-                key=lambda item: literature_candidate_sort_key(
-                    item, max(
+                key=lambda item: (
+                    not bool(item.get("cohort_match_entities")),
+                    -len(item.get("cohort_match_entities", [])),
+                    literature_candidate_sort_key(item, max(
                         path["per_query_candidate_score"] for path in item["retrieval_queries"]
                         if path.get("query") == query and path.get("per_query_candidate_score") is not None
-                    ),
+                    )),
                 ),
             )
             for item in query_ranked[:RERANK_CANDIDATES_PER_QUERY]:
@@ -1560,6 +1703,9 @@ class PlantBioRAG:
             "Literature candidate pool selection: %.2fs (%d of up to %d chunks)",
             pool_seconds, len(rerank_pool), rerank_pool_limit,
         )
+        questions_by_subject = subject_questions(candidates.get("priority_entities", []), expanded_queries, relevance_question)
+        for item in rerank_pool:
+            item["subject_questions"] = questions_by_subject
         reranker_started = time.perf_counter()
         try:
             rerank_results = self._semantic_rerank_chunks(
@@ -1604,8 +1750,16 @@ class PlantBioRAG:
             "Relevance judge: %.2fs (%d scored, fallback=%s)",
             reranker_seconds, scored_count, reranker_error,
         )
+        unjudged_position = 0
         for rank, item in enumerate(ranked_pool, start=1):
             item["rank"] = rank
+            if item.get("semantic_score") is None:
+                # Judge fallback: keep the best unscored passages in search order.
+                # ranked_pool already places them after every judged passage.
+                item["judge_unavailable"] = True
+                unjudged_position += 1
+                if unjudged_position > LITERATURE_UNJUDGED_FALLBACK_CHUNKS:
+                    item["rejection_reason"] = "Judge unavailable after retry; beyond unjudged fallback limit"
             if semantic_available and item.get("semantic_score") is not None and item["semantic_score"] < RERANK_MIN_SCORE:
                 item["rejection_reason"] = "Below semantic relevance threshold"
 
@@ -1626,6 +1780,7 @@ class PlantBioRAG:
         ]
         selected_entities = set()
         selection_rank = 0
+        unjudged_chunks: list[str] = []  # judge fallback, rendered under an "unverified" header
         while selection_pool:
             options = []
             for item in selection_pool:
@@ -1671,6 +1826,9 @@ class PlantBioRAG:
             item["new_evidence_entities"] = sorted(novel_entities)
             selected_entities.update(novel_entity_keys)
             included_chars += cost
+            if item.get("judge_unavailable"):
+                unjudged_chunks.append(rendered_chunk)
+                continue
             if starts_group:
                 nonempty_groups += 1
             grouped_chunks[best_query].append(rendered_chunk)
@@ -1681,6 +1839,9 @@ class PlantBioRAG:
             "judged" if semantic_available else "RRF-ranked (judge unavailable)",
             f"{included_chars:,}", f"{max_context_chars:,}",
         )
+        if unjudged_chunks:
+            logger.warning("Literature judge fallback: %d unscored passages included in search order and marked unverified",
+                           len(unjudged_chunks))
         logger.debug(
             "Literature rejections: %s",
             dict(Counter(
@@ -1727,6 +1888,7 @@ class PlantBioRAG:
                 "retry_calls": sum(bool(batch.get("retry")) for batch in getattr(self._chunk_reranker_usage, "batches", [])),
                 "token_usage": dict(self._chunk_reranker_usage.value),
                 "fallback_error": reranker_error,
+                "unjudged_fallback_included": len(unjudged_chunks),
             },
         }
 
@@ -1736,8 +1898,19 @@ class PlantBioRAG:
             for query in expanded_queries
             if grouped_chunks.get(query)
         ]
+        if unjudged_chunks:
+            missing_scores = sum(item.get("semantic_score") is None for item in rerank_pool)
+            parts.append(
+                "\n### Unverified context chunks (relevance judge unavailable):\n"
+                f"The relevance judge could not score {missing_scores} of {len(rerank_pool)} candidate passages. "
+                f"The {len(unjudged_chunks)} passages below were included by search ranking only and were not "
+                "checked for relevance. Use them with caution, and state in the Limitations section that "
+                "the relevance judge failed for part of the literature evidence.\n"
+                + os.linesep.join(unjudged_chunks)
+            )
 
         triple_candidates = candidates["triples"]
+        scope_relationships(triple_candidates, candidates.get("priority_entities", []), relevance_question)
         self._boost_connected_triple_relevance(relevance_question, triple_candidates)
         triple_candidates.sort(
             key=lambda item: (
@@ -1777,6 +1950,20 @@ class PlantBioRAG:
         ]
         if selected_triples:
             parts.append(relationship_header + "\n".join(selected_triples))
+        coverage = subject_coverage(candidates.get("priority_entities", []), expanded_queries,
+                                    relevance_question, all_chunks, triple_candidates)
+        diagnostics["subject_coverage"] = coverage
+        for subject, counts in coverage.items():
+            logger.info("Literature coverage [%s]: retrieved=%d, mentions=%d, judged=%d, accepted=%d, selected=%d, relationships=%d; rejections=%s",
+                        subject, counts["retrieved"], counts["mentioning_subject"], counts["judged"],
+                        counts["accepted"], counts["selected"], counts["selected_relationships"], counts["rejections"])
+        if coverage:
+            parts.append("### Resolved subject coverage (retrieval diagnostics, not biological evidence):\n"
+                         + json.dumps({subject: {key: value for key, value in counts.items()
+                                                if key not in ("assessments", "rejections")}
+                                       for subject, counts in coverage.items()}, ensure_ascii=False)
+                         + "\nAnswer the requested collection question first. This resolved set may be incomplete. "
+                         "Missing evidence does not establish absence. Do not substitute an off-list carrier list for an answer about these subjects.")
         context = "\n".join(parts)
         diagnostics["run_trace"]["timings_seconds"] = {
             **candidates["run_trace"]["timings_seconds"],
@@ -1957,6 +2144,7 @@ class PlantBioRAG:
     ) -> tuple[str, list[str], bool, bool, list[str], str, str]:
         prompt = (
             getPrompt("expand_question_and_queries")
+            + getPrompt("metadata_dependency_instructions")
             + f"""
         @@@@
         {q}
@@ -2277,7 +2465,24 @@ Input JSON:
                     ' -[' + type(r) + ']- ' +
                     coalesce(n2.displayName, n2.shortName, n2.id, n2.projectName,
                             n2.accessionName, n2.curatorName, elementId(n2))
-                END) AS triples
+                END) AS triples,
+                collect(DISTINCT CASE WHEN r IS NULL OR n2 IS NULL THEN NULL ELSE {{
+                    source: {{
+                        labels: labels(n1),
+                        name: coalesce(n1.displayName, n1.shortName, n1.name,
+                                       n1.id, n1.projectName, n1.accessionName,
+                                       n1.curatorName, elementId(n1)),
+                        crop: n1.crop, species: n1.species
+                    }},
+                    type: type(r),
+                    target: {{
+                        labels: labels(n2),
+                        name: coalesce(n2.displayName, n2.shortName, n2.name,
+                                       n2.id, n2.projectName, n2.accessionName,
+                                       n2.curatorName, elementId(n2)),
+                        crop: n2.crop, species: n2.species
+                    }}
+                }} END) AS relationship_records
         }}
         RETURN
             collect(DISTINCT n1 {{
@@ -2285,23 +2490,28 @@ Input JSON:
                 source_path: 'Metadata Graph', labels: labels(n1)
             }}) AS seedchunks,
             reduce(acc = [], items IN collect(neighbors) | acc + items) AS expandedchunks,
-            reduce(acc = [], items IN collect(triples) | acc + items) AS triples
+            reduce(acc = [], items IN collect(triples) | acc + items) AS triples,
+            reduce(acc = [], items IN collect(relationship_records) | acc + items) AS relationship_records
         """
         res = self.graph.query(query, params=params)
         if not res or not res[0]["seedchunks"]:
-            return [], [], []
+            return [], [], [], []
         seedchunks = [c for c in res[0]["seedchunks"] if c and c.get("chunk_id")]
         expandedchunks = [
             c for c in res[0]["expandedchunks"] if c and c.get("chunk_id")
         ]
         triples = [t for t in res[0]["triples"] if t is not None]
-        return seedchunks, expandedchunks, triples
+        relationship_records = [
+            record for record in res[0]["relationship_records"] if record is not None
+        ]
+        return seedchunks, expandedchunks, triples, relationship_records
 
     def _search_metadata_hybrid(
         self,
         expanded_queries: list[str],
         max_chars: int = METADATA_MAX_CONTEXT_CHARS,
         taxon_filter: Optional[dict[str, Any]] = None,
+        relationship_context: Optional[dict[str, str]] = None,
     ) -> str:
         # Hybrid search for metadata_graph.
         # Run expanded-query metadata hybrid searches concurrently.
@@ -2341,10 +2551,23 @@ Input JSON:
         selected_count = min(elbow_seed_count, METADATA_MAX_RESULTS_AFTER_RRF)
         top_nids = [nid for nid, _ in ranked[:selected_count]]
         if not top_nids:
+            if relationship_context is not None:
+                relationship_context["text"] = ""
             return ""
-        seeded_chunks, expanded_chunks, triples = self._expand_one_hop(
+        seeded_chunks, expanded_chunks, triples, relationship_records = self._expand_one_hop(
             top_nids, taxon_filter, METADATA_NEIGHBORS_PER_SEED
         )
+        if relationship_context is not None:
+            relation_lines = []
+            relation_chars = 0
+            for record in relationship_records:
+                line = json.dumps(record, ensure_ascii=False)
+                separator_chars = 1 if relation_lines else 0
+                if relation_chars + separator_chars + len(line) > 5000:
+                    break
+                relation_lines.append(line)
+                relation_chars += separator_chars + len(line)
+            relationship_context["text"] = "\n".join(relation_lines)
         all_chunks_deduplicated = self._dedupe_chunks(seeded_chunks + expanded_chunks)
         expanded_nids = [
             c.get("chunk_id") for c in all_chunks_deduplicated if c.get("chunk_id")
@@ -2395,11 +2618,13 @@ Input JSON:
         query: str,
         expanded_queries: list[str],
         taxon_filter: Optional[dict[str, Any]] = None,
+        relationship_context: Optional[dict[str, str]] = None,
     ) -> str:
         started = time.perf_counter()
         context_parts = []
         result = self._search_metadata_hybrid(
-            expanded_queries, METADATA_MAX_CONTEXT_CHARS, taxon_filter
+            expanded_queries, METADATA_MAX_CONTEXT_CHARS, taxon_filter,
+            relationship_context,
         )
         if result:
             context_parts.append(f"### Metadata Graph (Hybrid Search):\n{result}")
@@ -2564,6 +2789,9 @@ Input JSON:
         # Set when Jev judged the question to be about using Pretzel; the
         # keyword match below still applies so naming Pretzel always works.
         include_pretzel: bool = False,
+        metadata_plan: Optional[dict] = None,
+        grounding_diagnostics: Optional[dict] = None,
+        expanded_question: Optional[str] = None,
     ) -> Tuple[Optional[dict[str, Any]], str, str, dict[str, Any]]:
         source_errors = {}
         def safe_call(fn, label, *args):
@@ -2578,14 +2806,35 @@ Input JSON:
         # must remain eligible for ranking and context selection.
         literature_taxon_filter = None
         with ThreadPoolExecutor(max_workers=3) as executor:
-            metadata_future = executor.submit(
-                safe_call,
-                self._get_metadata_context,
-                "Metadata",
-                q,
-                expanded_queries,
-                taxon_filter,
-            )
+            metadata_queries = list(expanded_queries)
+            metadata_lookup = (metadata_plan or {}).get("metadata_lookup_question")
+            if isinstance(metadata_lookup, str) and metadata_lookup.strip():
+                metadata_queries.insert(0, metadata_lookup.strip())
+            metadata_context = None
+            if metadata_plan:
+                try:
+                    metadata_context = category_metadata_context(
+                        self.graph, q, metadata_plan, self._llm_invoke,
+                        getPrompt("metadata_category_selection"),
+                        grounding_diagnostics if grounding_diagnostics is not None else {}, logger,
+                    )
+                except Exception as error:
+                    source_errors["Metadata category selection"] = {"type": type(error).__name__, "message": str(error)}
+                    logger.warning("Metadata category selection failed; using hybrid metadata retrieval: %s", error)
+            if metadata_context is None:
+                metadata_context = safe_call(self._get_metadata_context, "Metadata", q, metadata_queries, taxon_filter)
+            grounded_question = q
+            if metadata_plan:
+                try:
+                    expanded_queries, grounded_question = ground_literature_queries(
+                        q, expanded_queries, metadata_context, metadata_plan,
+                        getPrompt("metadata_entity_extraction"), self._llm_invoke,
+                        grounding_diagnostics if grounding_diagnostics is not None else {},
+                        logger, expanded_question=expanded_question,
+                    )
+                except Exception as e:
+                    source_errors["Metadata entity extraction"] = {"type": type(e).__name__, "message": str(e)}
+                    logger.warning("Metadata entity extraction failed; using original queries: %s", e)
             literature_future = executor.submit(
                 safe_call,
                 self._get_literature_context_concurrent,
@@ -2594,6 +2843,7 @@ Input JSON:
                 k,
                 literature_taxon_filter,
                 q,
+                (grounding_diagnostics or {}).get("entities", []),
             )
             pretzel_future = None
             if include_pretzel or "pretzel" in q.lower():
@@ -2601,7 +2851,8 @@ Input JSON:
                     safe_call, self._get_pretzel_context, "Pretzel", expanded_queries
                 )
             literature_candidates = literature_future.result() or None
-            metadata_context = metadata_future.result()
+            if literature_candidates and grounded_question != q:
+                literature_candidates["relevance_question"] = grounded_question
             pretzel_context = pretzel_future.result() if pretzel_future else ""
         return literature_candidates, metadata_context, pretzel_context, source_errors
 
@@ -2946,10 +3197,21 @@ Input JSON:
 
             cached = None
             q_emb = None
+            analysis = expansion_diagnostics.get("parsed_response", {})
+            analysis = analysis if isinstance(analysis, dict) else {}
+            metadata_plan = {key: analysis.get(key) for key in (
+                "literature_depends_on_metadata", "metadata_dependency_reason", "metadata_lookup_question"
+            )} if (
+                analysis.get("literature_depends_on_metadata") is True
+                and not is_direct_agg_lookup
+            ) else None
+            logger.info("Literature depends on metadata: %s; reason: %s",
+                        bool(metadata_plan), analysis.get("metadata_dependency_reason", ""))
             if useCache:
                 with log_step("Semantic cache lookup", 0):
                     q_emb = await asyncio.to_thread(self.emb.embed_query, q)
-                    cached = await asyncio.to_thread(self._semantic_cache_lookup, q_emb)
+                    if not metadata_plan:
+                        cached = await asyncio.to_thread(self._semantic_cache_lookup, q_emb)
 
             if cached:
                 cached_expanded_question, cached_answer, _cached_usage = cached
@@ -3058,7 +3320,11 @@ Input JSON:
             )
             yield StageChangeEvent(state=state)
 
-            # Run literature, metadata, and Pretzel context retrieval concurrently.
+            grounding_diagnostics: dict = {
+                "depends_on_metadata": bool(metadata_plan),
+                "reason": analysis.get("metadata_dependency_reason", ""),
+            }
+            # Dependent literature searches wait for metadata entity resolution.
             with log_step("Context retrieval", 2):
                 taxon_filter = (
                     resolve_taxon_filter(q, species) if SPECIES_FILTER_ENABLED else None
@@ -3081,8 +3347,27 @@ Input JSON:
                         k,
                         taxon_filter,
                         is_pretzel_question,
+                        metadata_plan,
+                        grounding_diagnostics,
+                        expanded_question,
                     )
                 )
+
+            category_usage = grounding_diagnostics.get("category_selection", {}).get("usage_metadata")
+            if category_usage:
+                token_tally.append(_token_tally_entry("Metadata category selection", GEMINI_MODEL, category_usage))
+            if grounding_diagnostics.get("usage_metadata"):
+                token_tally.append(_token_tally_entry(
+                    "Metadata entity extraction", GEMINI_MODEL,
+                    grounding_diagnostics["usage_metadata"],
+                ))
+            if grounding_diagnostics.get("grounded_question"):
+                expanded_question = grounding_diagnostics["grounded_question"]
+                expanded_queries = grounding_diagnostics["retrieval_queries"]
+                state = state.model_copy(update={
+                    "expanded_question": expanded_question, "retrieval_queries": expanded_queries,
+                })
+                yield StageChangeEvent(state=state)
 
             # Judge the literature candidates and assemble the literature
             # context. Non-fatal, like retrieval: a failure here leaves the
@@ -3112,6 +3397,7 @@ Input JSON:
             literature_diagnostics.pop("run_trace", None)
             retrieval_diagnostics = {
                 "literature": literature_diagnostics, "source_errors": source_errors,
+                "metadata_grounding": grounding_diagnostics,
             }
             # Expose exactly what was retrieved from Neo4j and will be added
             # to the answer-generation prompt, so it can be inspected without
