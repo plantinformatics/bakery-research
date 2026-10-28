@@ -38,7 +38,7 @@ from literature_subject_scope import (subject_questions, parse_subject_assessmen
                                       scope_relationships, subject_coverage,
                                       relationship_scope_filter, RELEVANCE_BOOST_RELATIONS,
                                       derive_subject_assessments)
-from literature_graph_expansion import expand_literature_graph
+from literature_graph_expansion import SharedSeedExpansion, expand_literature_graph
 from literature_candidate_ranking import extract_literature_entity_terms, literature_candidate_sort_key, score_literature_candidate_texts, score_literature_candidate_vectors
 from taxon_filter import metadata_matches_taxon, resolve_taxon_filter, taxon_regex, text_is_clearly_other_taxon
 
@@ -433,6 +433,7 @@ MAX_LITERATURE_CONTEXT_CHARS = 180000
 LITERATURE_CONTEXT_CHARS_STEP = 10000
 MAX_TRIPLES = 50
 LITERATURE_TRIPLE_MAX_CHARACTERS = 5000  # Separate budget for literature relationships.
+LITERATURE_TRIPLE_MAX_SOURCES = 3  # Supporting files named per relationship; the rest are counted as "+N more".
 RERANK_MAX_TEXT_CHARS = 1500  # Passage excerpt sent to the semantic evidence judge.
 LITERATURE_EXPANSION_SCORE_DISCOUNT = 0.5  # One-hop graph matches borrow only part of their originating chunk's RRF score.
 EXACT_ENTITY_MATCH_K = 200  # Full-text candidates for terms explicitly named in the original question.
@@ -829,6 +830,7 @@ class PlantBioRAG:
         query_label: str = "query",
         priority_entities: Optional[list[str]] = None,
         read_cache=None,
+        shared_expansion=None,
     ) -> dict:
         query_started = time.perf_counter()
         search_trace = {}
@@ -919,6 +921,9 @@ class PlantBioRAG:
         hybrid_search_seconds = time.perf_counter() - query_started
         logger.info("Literature [%s]: search ready in %.1fs; expanding %d seeds",
                     query_label, hybrid_search_seconds, len(seed_cids))
+        if shared_expansion is not None:
+            # Wait for every query's seeds; the union is fetched and indexed once.
+            shared_expansion.arrive(seed_cids)
         seed_ids_by_expanded_chunk: dict[Any, set[str]] = {}
         seeded_chunks, expanded_chunks, triples, expansion_timings = expand_literature_graph(
             self.graph, seed_cids, [candidate_by_id[cid] for cid in seed_cids if cid in candidate_by_id],
@@ -926,23 +931,23 @@ class PlantBioRAG:
             keep_relationship=relationship_scope_filter(priority_entities),
         )
         logger.info(
-            'Literature query [%s] "%s": %.2fs = hybrid search %.2fs (%d seeds) + graph neighbours %.2fs (%d neighbour chunks, %d relationship-neighbour combinations)',
+            'Literature query [%s] "%s": %.2fs = hybrid search %.2fs (%d seeds) + graph neighbours %.2fs (%d neighbour chunks, %d relationship triples)',
             query_label, expanded_query,
             hybrid_search_seconds + expansion_timings["total_seconds"],
             hybrid_search_seconds, expansion_timings.get("seed_count", 0),
             expansion_timings["total_seconds"], expansion_timings.get("neighbor_count", 0),
-            expansion_timings.get("triple_count", 0),
+            expansion_timings.get("grouped_triple_count", 0),
         )
-        logger.info("Literature [%s]: %d unique seed-neighbour links used for provenance (%d relationship-neighbour combinations)",
-                    query_label, expansion_timings.get("unique_seed_neighbor_links", 0),
-                    expansion_timings.get("triple_count", 0))
+        logger.info("Literature [%s]: %d unique seed-neighbour links used for provenance",
+                    query_label, expansion_timings.get("unique_seed_neighbor_links", 0))
         # Fetch stages share in-flight reads across queries, so a stage can include
         # time spent waiting for another query's identical fetch.
         logger.info("Literature [%s] graph expansion stages: relations %.2fs, neighbour links %.2fs, "
-                    "neighbour texts %.2fs, triple assembly %.2fs; relationships kept %d of %d",
+                    "neighbour texts %.2fs, seed index %.2fs, triple assembly %.2fs; relationships kept %d of %d",
                     query_label, expansion_timings.get("relation_fetch_seconds", 0.0),
                     expansion_timings.get("neighbor_link_fetch_seconds", 0.0),
                     expansion_timings.get("neighbor_text_fetch_seconds", 0.0),
+                    expansion_timings.get("seed_index_seconds", 0.0),
                     expansion_timings.get("triple_assembly_seconds", 0.0),
                     expansion_timings.get("relationship_edges_kept", 0),
                     expansion_timings.get("relationship_edges_total", 0))
@@ -1385,6 +1390,10 @@ class PlantBioRAG:
         searches = {}
         completion_order = []
         read_cache = LiteratureReadCache()
+        shared_expansion = SharedSeedExpansion(
+            self.graph, len(expanded_queries), read_cache,
+            relationship_scope_filter(priority_entities),
+        )
         with ThreadPoolExecutor(max_workers=min(10, len(expanded_queries))) as executor:
             futures = {
                 executor.submit(
@@ -1400,6 +1409,7 @@ class PlantBioRAG:
                     ),
                     priority_entities=priority_entities,
                     read_cache=read_cache,
+                    shared_expansion=shared_expansion,
                 ): query for index, query in enumerate(expanded_queries)
             }
             for future in as_completed(futures):
@@ -1477,6 +1487,15 @@ class PlantBioRAG:
         logger.info("Shared literature processing: %d seed uses, %d unique seeds processed, %d reused expansions",
                     shared_processing["seed_uses_across_queries"], shared_processing["unique_seeds_processed"],
                     shared_processing["reused_seed_expansions"])
+        if shared_expansion.timings:
+            shared_processing["union_expansion"] = shared_expansion.timings
+            logger.info("Shared seed expansion: %d unique seeds expanded once in %.2fs "
+                        "(relations %.2fs, neighbour links %.2fs, neighbour texts %.2fs, seed index %.2fs)",
+                        shared_expansion.timings["unique_seed_count"], shared_expansion.timings["total_seconds"],
+                        shared_expansion.timings["relation_fetch_seconds"],
+                        shared_expansion.timings["neighbor_link_fetch_seconds"],
+                        shared_expansion.timings["neighbor_text_fetch_seconds"],
+                        shared_expansion.timings["seed_index_seconds"])
         search_seconds = time.perf_counter() - literature_started
         logger.info(
             "Literature retrieval, %d %s in parallel: %.2fs wall",
@@ -1922,14 +1941,43 @@ class PlantBioRAG:
         )
         selected_triples, triple_chars = [], 0
         relationship_header = "### Entity Relationships (deduplicated and question-ranked):\n"
+        # A merged relationship's sources are every file mentioning its target, so
+        # cite only files with a retrieved chunk naming both endpoints (at most
+        # LITERATURE_TRIPLE_MAX_SOURCES); leave it bare when none do. Word-token
+        # postings narrow each name to candidate chunks before the exact match.
+        source_chunks = [item for item in all_chunks if item.get("text")]
+        postings: dict[str, set[int]] = {}
+        for index, chunk in enumerate(source_chunks):
+            for token in set(re.findall(r"[^\W_]+", chunk["text"].casefold())):
+                postings.setdefault(token, set()).add(index)
+        chunks_naming: dict[str, set[int]] = {}
         for rank, item in enumerate(triple_candidates, start=1):
             item["rank"] = rank
-            item["text"] = (
-                f"[Source: {'; '.join(sorted(item['sources']))}] "
-                f"{item['relationship']}"
-            )
+            item["text"] = item["relationship"]
             if item["rejection_reason"]:
                 continue
+            if len(selected_triples) < MAX_TRIPLES and (
+                triple_chars + len(item["text"]) <= LITERATURE_TRIPLE_MAX_CHARACTERS
+            ):
+                endpoints = re.match(r"^(.+?) -\[[^\]]+\]-> (.+)$", item["relationship"])
+                naming = []
+                for name in endpoints.groups() if endpoints else ():
+                    if name not in chunks_naming:
+                        tokens = re.findall(r"[^\W_]+", name.casefold())
+                        candidate_ids = set.intersection(*(postings.get(token, set()) for token in tokens)) if tokens else set()
+                        # [^\W_] boundary so markdown emphasis such as _CDC Landmark_ still matches.
+                        pattern = re.compile(r"(?<![^\W_])" + re.escape(name) + r"(?![^\W_])", re.IGNORECASE)
+                        chunks_naming[name] = {index for index in candidate_ids if pattern.search(source_chunks[index]["text"])}
+                    naming.append(chunks_naming[name])
+                both = set.intersection(*naming) if naming else set()
+                supporting = sorted({source_chunks[index].get("source_path", "") for index in both} & set(item["sources"]))
+                item["supporting_sources"] = supporting
+                if supporting:
+                    more = len(supporting) - LITERATURE_TRIPLE_MAX_SOURCES
+                    item["text"] = (
+                        f"[Source: {'; '.join(supporting[:LITERATURE_TRIPLE_MAX_SOURCES])}"
+                        f"{f' +{more} more' if more > 0 else ''}] {item['relationship']}"
+                    )
             if len(selected_triples) >= MAX_TRIPLES:
                 item["rejection_reason"] = "Outside relationship count limit"
             elif triple_chars + len(item["text"]) > LITERATURE_TRIPLE_MAX_CHARACTERS:
