@@ -34,6 +34,11 @@ class LiteratureReadCache:
                     pending[key].set_result(grouped[key])
         return [row for key in keys for row in pending[key].result()]
 
+    def contains(self, namespace, key):
+        """True when key is stored or being computed (compute_once will wait for it)."""
+        with self._lock:
+            return (namespace, key) in self._entries
+
     def compute_once(self, namespace, key, build):
         """Share an immutable processed value, including work still in flight."""
         identity = (namespace, key)
