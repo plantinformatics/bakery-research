@@ -434,6 +434,7 @@ LITERATURE_CONTEXT_CHARS_STEP = 10000
 MAX_TRIPLES = 50
 LITERATURE_TRIPLE_MAX_CHARACTERS = 5000  # Separate budget for literature relationships.
 LITERATURE_TRIPLE_MAX_SOURCES = 3  # Supporting files named per relationship; the rest are counted as "+N more".
+LITERATURE_BRIDGE_MAX_MIDDLES = 3  # Middle entities whose two-step bridges between question identifiers are boosted.
 RERANK_MAX_TEXT_CHARS = 1500  # Passage excerpt sent to the semantic evidence judge.
 LITERATURE_EXPANSION_SCORE_DISCOUNT = 0.5  # One-hop graph matches borrow only part of their originating chunk's RRF score.
 EXACT_ENTITY_MATCH_K = 200  # Full-text candidates for terms explicitly named in the original question.
@@ -1370,6 +1371,44 @@ class PlantBioRAG:
                 source in bridge_entities or target in bridge_entities
             ):
                 item["relevance_score"] += 10.0
+
+        # Two-step bridges: when two edges join different question identifiers
+        # through one middle entity (Pi321999 -[HAS]-> Lrt2 -[ALLELICTO]-> Lr34),
+        # rank both above single-identifier edges such as "X carries Lr34".
+        # Identifiers are question tokens mixing letters and digits (gene,
+        # locus and accession names), so trait words cannot form bridges.
+        # Only the most specific middles (fewest candidate edges) count, so
+        # hubs such as "Stripe Rust" do not bridge every pair of rust genes.
+        # Direct edges naming two identifiers get the same boost.
+        identifiers = {term for term in question_terms if re.search(r"[a-z]", term) and re.search(r"\d", term)}
+        if len(identifiers) >= 2:
+            edges_by_middle: dict[str, list[tuple[dict[str, Any], frozenset[str]]]] = {}
+            degree: dict[str, int] = {}
+            for item, source, target, normalized_type in parsed:
+                if item.get("rejection_reason") or normalized_type in {"CITEDIN", "HASDOI", "BELONGSTOSPECIES"}:
+                    continue
+                degree[source] = degree.get(source, 0) + 1
+                degree[target] = degree.get(target, 0) + 1
+                source_ids = identifiers & set(re.findall(r"[a-z0-9]+", source))
+                target_ids = identifiers & set(re.findall(r"[a-z0-9]+", target))
+                if len(source_ids | target_ids) >= 2:
+                    item["relevance_score"] += 50.0
+                elif source_ids and not target_ids:
+                    edges_by_middle.setdefault(target, []).append((item, frozenset(source_ids)))
+                elif target_ids and not source_ids:
+                    edges_by_middle.setdefault(source, []).append((item, frozenset(target_ids)))
+            bridges = {
+                middle: {
+                    id(item): item
+                    for item, ids in edges for _other, other_ids in edges
+                    if not ids & other_ids
+                }
+                for middle, edges in edges_by_middle.items()
+            }
+            specific = sorted((middle for middle, bridged in bridges.items() if bridged), key=lambda middle: degree[middle])
+            for middle in specific[:LITERATURE_BRIDGE_MAX_MIDDLES]:
+                for item in bridges[middle].values():
+                    item["relevance_score"] += 50.0
 
     # Stage: RETRIEVING_CONTEXT. Run all expanded literature searches
     # concurrently, merge them, and rank the candidates by RRF with the
