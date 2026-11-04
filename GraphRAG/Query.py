@@ -40,7 +40,7 @@ from literature_subject_scope import (subject_questions, parse_subject_assessmen
                                       derive_subject_assessments)
 from literature_graph_expansion import SharedSeedExpansion, expand_literature_graph
 from literature_candidate_ranking import extract_literature_entity_terms, literature_candidate_sort_key, score_literature_candidate_texts, score_literature_candidate_vectors
-from taxon_filter import metadata_matches_taxon, resolve_taxon_filter, taxon_regex, text_is_clearly_other_taxon
+from taxon_filter import TAXON_ALIASES, metadata_matches_taxon, resolve_taxon_filter, taxon_regex, text_is_clearly_other_taxon
 
 load_dotenv(Path(__file__).resolve().parents[1] / ".env")
 
@@ -434,7 +434,7 @@ LITERATURE_CONTEXT_CHARS_STEP = 10000
 MAX_TRIPLES = 50
 LITERATURE_TRIPLE_MAX_CHARACTERS = 5000  # Separate budget for literature relationships.
 LITERATURE_TRIPLE_MAX_SOURCES = 3  # Supporting files named per relationship; the rest are counted as "+N more".
-LITERATURE_BRIDGE_MAX_MIDDLES = 3  # Middle entities whose two-step bridges between question identifiers are boosted.
+LITERATURE_BRIDGE_MAX_MIDDLES = 3  # Middle entities whose two-step bridges between question entities are boosted.
 RERANK_MAX_TEXT_CHARS = 1500  # Passage excerpt sent to the semantic evidence judge.
 LITERATURE_EXPANSION_SCORE_DISCOUNT = 0.5  # One-hop graph matches borrow only part of their originating chunk's RRF score.
 EXACT_ENTITY_MATCH_K = 200  # Full-text candidates for terms explicitly named in the original question.
@@ -1328,7 +1328,9 @@ class PlantBioRAG:
 
     @staticmethod
     def _boost_connected_triple_relevance(
-        question: str, triples: list[dict[str, Any]]
+        question: str, triples: list[dict[str, Any]],
+        subjects: Optional[list[str]] = None,
+        asked_question: Optional[str] = None,
     ) -> None:
         """Promote one-hop biological evidence linked to a question-matched triple."""
         stop_words = {
@@ -1372,36 +1374,72 @@ class PlantBioRAG:
             ):
                 item["relevance_score"] += 10.0
 
-        # Two-step bridges: when two edges join different question identifiers
-        # through one middle entity (Pi321999 -[HAS]-> Lrt2 -[ALLELICTO]-> Lr34),
-        # rank both above single-identifier edges such as "X carries Lr34".
-        # Identifiers are question tokens mixing letters and digits (gene,
-        # locus and accession names), so trait words cannot form bridges.
-        # Only the most specific middles (fewest candidate edges) count, so
-        # hubs such as "Stripe Rust" do not bridge every pair of rust genes.
-        # Direct edges naming two identifiers get the same boost.
-        identifiers = {term for term in question_terms if re.search(r"[a-z]", term) and re.search(r"\d", term)}
-        if len(identifiers) >= 2:
+        # Two-step bridges: when two edges join different question entities
+        # through one middle entity (Pi321999 -[CARRIESGENE]-> Lrt2 -[ALLELICTO]-> Lr34,
+        # or Cdc Landmark -[CARRIESGENE]-> Yr29 -[PLEIOTROPICTO]-> Lr46), rank both
+        # above edges naming one entity such as "X carries Lr34". Question entities
+        # are the resolved subjects plus candidate graph entities named in the
+        # user's own question, excluding species and generic category words. With
+        # subjects, a pair must join a subject to something else asked about, not
+        # two subjects. Only the most specific middles (fewest candidate edges)
+        # count, so hubs such as "Stripe Rust" do not bridge every pair of rust
+        # genes. Direct edges naming a pair get the same boost.
+        asked_text = asked_question or question
+        asked_tokens = set(re.findall(r"[^\W_]+", asked_text.casefold()))
+        subject_names = {subject.casefold() for subject in subjects or []}
+        not_entities = stop_words | {alias for aliases in TAXON_ALIASES.values() for alias in aliases} | {
+            "accession", "accessions", "cultivar", "cultivars", "variety", "varieties",
+            "line", "lines", "gene", "genes", "allele", "alleles", "trait", "traits",
+        }
+        usable = [edge for edge in parsed
+                  if not edge[0].get("rejection_reason") and edge[3] not in {"CITEDIN", "HASDOI", "BELONGSTOSPECIES"}]
+        endpoint_tokens = {name: set(re.findall(r"[^\W_]+", name)) for edge in usable for name in edge[1:3]}
+        entities = subject_names | {
+            name for name, tokens in endpoint_tokens.items()
+            if len(name) > 1 and tokens and tokens <= asked_tokens
+            and name not in not_entities and not tokens <= not_entities
+            and matching_subjects(asked_text, [name])
+        }
+        logger.info("Literature relationship bridge entities: %s", sorted(entities))
+        entity_tokens = {entity: set(re.findall(r"[^\W_]+", entity)) for entity in entities}
+        endpoint_entities = {
+            name: frozenset(entity for entity, tokens in entity_tokens.items()
+                            if tokens <= name_tokens and matching_subjects(name, [entity]))
+            for name, name_tokens in endpoint_tokens.items()
+        }
+
+        def joins_entities(first: frozenset[str], second: frozenset[str]) -> bool:
+            if first & second:
+                return False
+            if not subject_names:
+                return True
+            return bool((first & subject_names and second - subject_names)
+                        or (second & subject_names and first - subject_names))
+
+        def names_pair(names: frozenset[str]) -> bool:
+            return any(joins_entities(frozenset({first}), frozenset({second})) for first in names for second in names)
+
+        if len(entities) >= 2:
             edges_by_middle: dict[str, list[tuple[dict[str, Any], frozenset[str]]]] = {}
             degree: dict[str, int] = {}
-            for item, source, target, normalized_type in parsed:
-                if item.get("rejection_reason") or normalized_type in {"CITEDIN", "HASDOI", "BELONGSTOSPECIES"}:
-                    continue
+            for item, source, target, _normalized_type in usable:
                 degree[source] = degree.get(source, 0) + 1
                 degree[target] = degree.get(target, 0) + 1
-                source_ids = identifiers & set(re.findall(r"[a-z0-9]+", source))
-                target_ids = identifiers & set(re.findall(r"[a-z0-9]+", target))
-                if len(source_ids | target_ids) >= 2:
+                source_ids = endpoint_entities[source]
+                target_ids = endpoint_entities[target]
+                if source_ids and target_ids and joins_entities(source_ids, target_ids):
+                    item["relevance_score"] += 100.0
+                elif names_pair(source_ids | target_ids):
                     item["relevance_score"] += 50.0
                 elif source_ids and not target_ids:
-                    edges_by_middle.setdefault(target, []).append((item, frozenset(source_ids)))
+                    edges_by_middle.setdefault(target, []).append((item, source_ids))
                 elif target_ids and not source_ids:
-                    edges_by_middle.setdefault(source, []).append((item, frozenset(target_ids)))
+                    edges_by_middle.setdefault(source, []).append((item, target_ids))
             bridges = {
                 middle: {
                     id(item): item
                     for item, ids in edges for _other, other_ids in edges
-                    if not ids & other_ids
+                    if joins_entities(ids, other_ids)
                 }
                 for middle, edges in edges_by_middle.items()
             }
@@ -1629,6 +1667,7 @@ class PlantBioRAG:
         )
         return {
             "relevance_question": relevance_question,
+            "asked_question": original_question,
             "priority_entities": priority_entities or [],
             "expanded_queries": expanded_queries,
             "chunks": all_chunks,
@@ -1969,7 +2008,9 @@ class PlantBioRAG:
 
         triple_candidates = candidates["triples"]
         scope_relationships(triple_candidates, candidates.get("priority_entities", []), relevance_question)
-        self._boost_connected_triple_relevance(relevance_question, triple_candidates)
+        self._boost_connected_triple_relevance(
+            relevance_question, triple_candidates, candidates.get("priority_entities", []), candidates.get("asked_question"),
+        )
         triple_candidates.sort(
             key=lambda item: (
                 item["relevance_score"],
