@@ -1427,7 +1427,9 @@ class PlantBioRAG:
                 degree[target] = degree.get(target, 0) + 1
                 source_ids = endpoint_entities[source]
                 target_ids = endpoint_entities[target]
-                if names_pair(source_ids | target_ids):
+                if source_ids and target_ids and joins_entities(source_ids, target_ids):
+                    item["relevance_score"] += 100.0
+                elif names_pair(source_ids | target_ids):
                     item["relevance_score"] += 50.0
                 elif source_ids and not target_ids:
                     edges_by_middle.setdefault(target, []).append((item, source_ids))
